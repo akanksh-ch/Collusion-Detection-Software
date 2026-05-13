@@ -1,3 +1,4 @@
 personal-docs/
 .obsidian
 out/
+.venv/
