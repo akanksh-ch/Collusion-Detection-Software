@@ -42,5 +42,7 @@ EOF
     rm -f "$temp_script"
 done
 
+rm -r workspace/
+
 echo "------------------------------------------------"
 echo "Done. Bag of Nodes generated"
