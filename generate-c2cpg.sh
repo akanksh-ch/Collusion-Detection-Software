@@ -11,7 +11,7 @@ find "$TARGET_DIR" -type f -name "*.c" | while read -r src_file; do
     echo "Generating CPG: $src_file -> $out_file"
     
     # Execute joern-c2cpg (assumes it is in your PATH)
-    joern-c2cpg "$src_file" --output "$out_file"
+    c2cpg.sh "$src_file" --output "$out_file"
 done
 
 echo "Done. All individual CPGs are ready for analysis."
