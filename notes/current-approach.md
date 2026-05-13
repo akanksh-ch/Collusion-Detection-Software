@@ -1,1 +1,1 @@
-Turn code into a graph (CPG) -> use `graph2vec` to convert CPGs into a format that DBSCAN can understand -> identify colluding rings (DBSCAN clustering for graphs) -> request human to review clusters -> justice
+Turn code into a syntax-independent format (Code Property Graphs) -> convert CPG into a format that a clustering algorithm can understand (Bag of Nodes, Graph2Vec, WL Feature Extraction) -> Clustering algorithm to find colluding rings (DBSCAN) -> request human to review clusters -> justice
