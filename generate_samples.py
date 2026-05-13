@@ -9,7 +9,7 @@ from pathlib import Path
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "granite4.1:8b"
 
-OUTPUT_DIR = "fibonacci_c_solutions"
+OUTPUT_DIR = "out/fibonacci_c_solutions"
 
 METHODS = {
     "recursive": {
