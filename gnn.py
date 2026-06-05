@@ -5,8 +5,7 @@ import hashlib
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 class StructuralEncoder:
-    """Processes structural graph metrics using a Weisfeiler-Lehman (WL) neighborhood 
-    isomorphism fingerprinting engine combined with character-level textual style profiles."""
+    """Generates composite embeddings combining structural graph shapes and textual style profiles."""
     def __init__(self, node_vocab_size, edge_vocab_size, wl_buckets=128, wl_iterations=2):
         self.node_vocab_size = node_vocab_size
         self.edge_vocab_size = edge_vocab_size
@@ -14,6 +13,7 @@ class StructuralEncoder:
         self.wl_iterations = wl_iterations
         self.tfidf_disabled = False
         
+        # Character-level n-gram capture to model indentation and code structure habits
         self.tfidf = TfidfVectorizer(
             analyzer='char_wb',
             ngram_range=(3, 5),
@@ -21,7 +21,7 @@ class StructuralEncoder:
         )
 
     def fit_cohort_text(self, corpus_list):
-        """Fits the global TF-IDF spatial vocabulary context across the cohort text strings."""
+        """Builds global contextual vocabulary models across the student cohort corpus."""
         clean_corpus = [c for c in corpus_list if c.strip()]
         if not clean_corpus:
             self.tfidf_disabled = True
@@ -29,27 +29,28 @@ class StructuralEncoder:
         try:
             self.tfidf.fit(clean_corpus)
         except ValueError:
-            logging.warning("[TF-IDF ALERT] Slices are textually empty. Falling back to topology layers only.")
+            logging.warning("[TF-IDF ALERT] Empty content corpus strings. Fallback mode active.")
             self.tfidf_disabled = True
 
     def compute_wl_topological_fingerprint(self, pyg_data):
-        """Implements a color-refinement graph isomorphism mapping trick to isolate sub-tree patterns."""
+        """Generates topological hashes invariant to simple renaming and variable refactoring."""
         num_nodes = pyg_data.x.size(0) if pyg_data.x is not None else 0
         if num_nodes == 0:
             return np.zeros(self.wl_buckets)
 
         node_colors = pyg_data.x.view(-1).long().numpy().astype(str)
         edge_index = pyg_data.edge_index.numpy()
-        
         edge_attrs = (pyg_data.edge_attr.numpy() if hasattr(pyg_data, 'edge_attr') and 
                       pyg_data.edge_attr is not None else np.zeros(edge_index.shape[1], dtype=int))
         
         wl_histogram = np.zeros(self.wl_buckets)
 
+        # Baseline assignment pass
         for c in node_colors:
             bucket = int(hashlib.md5(c.encode('utf-8')).hexdigest(), 16) % self.wl_buckets
             wl_histogram[bucket] += 1
 
+        # Iterative structural color refinement loop
         for _ in range(self.wl_iterations):
             adjacency_map = {i: [] for i in range(num_nodes)}
             for idx in range(edge_index.shape[1]):
@@ -60,9 +61,8 @@ class StructuralEncoder:
             new_colors = []
             for node_idx in range(num_nodes):
                 current_color = node_colors[node_idx]
-                sorted_neighbor_tokens = sorted([f"{nc}_{et}" for nc, et in adjacency_map[node_idx]])
-                neighbor_signature = ",".join(sorted_neighbor_tokens)
-                combined_signature = f"{current_color}|{neighbor_signature}"
+                sorted_neighbors = sorted([f"{nc}_{et}" for nc, et in adjacency_map[node_idx]])
+                combined_signature = f"{current_color}|{','.join(sorted_neighbors)}"
                 
                 new_color = hashlib.md5(combined_signature.encode('utf-8')).hexdigest()
                 new_colors.append(new_color)
@@ -78,16 +78,15 @@ class StructuralEncoder:
 
         return wl_histogram
 
-    def encode_submission(self, pyg_data):
-        """Transforms relational configurations and text code sub-tokens into a single, 
-        monolithic, global unit-normalized 1D vector fingerprint."""
-        # 1. Compute WL Graph Kernel Structural Histogram
+    def encode_submission(self, pyg_data, alpha=0.5):
+        """Assembles and scales architectural shapes and style metrics into a single unit vector."""
+        
+        # 1. Structural Weisfeiler-Lehman Extraction
         wl_topological_vector = self.compute_wl_topological_fingerprint(pyg_data)
 
-        # 2. Extract Macro Scale Metrics
+        # 2. Extract Macro Topological Dimensions
         num_nodes = pyg_data.x.size(0) if pyg_data.x is not None else 0
         num_edges = pyg_data.edge_index.size(1) if pyg_data.edge_index is not None else 0
-        
         scale_invariants = np.array([
             np.log1p(num_nodes),
             np.log1p(num_edges),
@@ -99,7 +98,7 @@ class StructuralEncoder:
         if struct_norm > 0:
             structural_features = structural_features / struct_norm
 
-        # 3. Extract Character-level Lexical Style Arrays
+        # 3. Lexical Stylometry Token Extraction
         text_document = getattr(pyg_data, 'text_document', '')
         if text_document and not self.tfidf_disabled and hasattr(self.tfidf, 'vocabulary_'):
             try:
@@ -113,12 +112,12 @@ class StructuralEncoder:
         if text_norm > 0:
             text_features = text_features / text_norm
 
-        # Combine components into a single array
-        combined_fingerprint = np.concatenate([structural_features, text_features])
+        # Apply root scaling coefficients to project orthogonal fields onto an L2 unit circle
+        scaled_structural = np.sqrt(alpha) * structural_features
+        scaled_text = np.sqrt(1.0 - alpha) * text_features
+        combined_fingerprint = np.concatenate([scaled_structural, scaled_text])
         
-        # --- CRITICAL FIX: Global Unit-Normalization ---
-        # Enforcing that the total L2-norm of the final vector is exactly 1.0 
-        # allows accelerated Euclidean space trees to perfectly mimic Cosine thresholds.
+        # Enforce exact unit normalization to allow accelerated Euclidean tree lookups
         global_norm = np.linalg.norm(combined_fingerprint)
         if global_norm > 0:
             combined_fingerprint = combined_fingerprint / global_norm

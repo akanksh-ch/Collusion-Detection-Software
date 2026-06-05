@@ -6,41 +6,46 @@ from torch_geometric.data import Data
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 def _load_and_slice_single_file(args):
-    """Worker task that handles localized IO parsing, slicing, and maps them to clean primitives."""
-    file_path, node_vocab, edge_vocab = args
+    """Worker process task: handles parsing, isolates core code logic lineages, 
+
+    and serializes the results into lightweight dictionaries."""
+    file_path, node_vocab, edge_vocab, bypass_slicing = args
     student_id = os.path.basename(file_path).replace(".graphml", "")
     
     try:
         G = nx.read_graphml(file_path)
         
-        # --- CONTEXT-AWARE BACKWARD SLICING ENGINE ---
-        sinks = [n for n, attrs in G.nodes(data=True) if attrs.get('label', '').upper() in ['RETURN', 'METHOD_RETURN']]
-        if not sinks:
-            sinks = [n for n in G.nodes() if G.out_degree(n) == 0]
-            
-        if sinks:
-            sliced_nodes = set(sinks)
-            queue = list(sinks)
-            while queue:
-                current = queue.pop(0)
-                for pred in G.predecessors(current):
-                    edge_data = G.get_edge_data(pred, current)
-                    is_valid = any(G.get_edge_data(pred, current)[k].get('label', '').upper() in ['REACHING_DEF', 'CDG', 'CFG', 'DDG'] for k in edge_data)
-                    if is_valid and pred not in sliced_nodes:
-                        sliced_nodes.add(pred)
-                        queue.append(pred)
-                        
-            if len(sliced_nodes) >= 3:
-                enriched_nodes = set(sliced_nodes)
-                for node in sliced_nodes:
-                    for neighbor in G.neighbors(node):
-                        if any(G.get_edge_data(node, neighbor)[k].get('label', '').upper() == 'AST' for k in G.get_edge_data(node, neighbor)):
-                            enriched_nodes.add(neighbor)
-                sliced_G = G.subgraph(enriched_nodes).copy()
-                if sliced_G.number_of_edges() > 0:
-                    G = sliced_G
+        # Isolate code lineages using a backward dependency graph walk from exit points
+        if not bypass_slicing:
+            sinks = [n for n, attrs in G.nodes(data=True) if attrs.get('label', '').upper() in ['RETURN', 'METHOD_RETURN']]
+            if not sinks:
+                sinks = [n for n in G.nodes() if G.out_degree(n) == 0]
+                
+            if sinks:
+                sliced_nodes = set(sinks)
+                queue = list(sinks)
+                while queue:
+                    current = queue.pop(0)
+                    for pred in G.predecessors(current):
+                        edge_data = G.get_edge_data(pred, current)
+                        # Verify edge labels map to actual control or data flow transitions
+                        is_valid = any(G.get_edge_data(pred, current)[k].get('label', '').upper() in ['REACHING_DEF', 'CDG', 'CFG', 'DDG'] for k in edge_data)
+                        if is_valid and pred not in sliced_nodes:
+                            sliced_nodes.add(pred)
+                            queue.append(pred)
+                            
+                # Fall back to original graph layout if the slice strips too much context
+                if len(sliced_nodes) >= 3:
+                    enriched_nodes = set(sliced_nodes)
+                    for node in sliced_nodes:
+                        for neighbor in G.neighbors(node):
+                            if any(G.get_edge_data(node, neighbor)[k].get('label', '').upper() == 'AST' for k in G.get_edge_data(node, neighbor)):
+                                enriched_nodes.add(neighbor)
+                    sliced_G = G.subgraph(enriched_nodes).copy()
+                    if sliced_G.number_of_edges() > 0:
+                        G = sliced_G
 
-        # Map structural data models directly to PyG dictionaries
+        # Map graph properties into vocab vectors and aggregate text tokens
         node_features = []
         node_text_corpus = []
         node_to_idx = {}
@@ -62,28 +67,27 @@ def _load_and_slice_single_file(args):
         if len(edges) == 0:
             return student_id, None
 
-        # Build clean raw serializable payloads
-        payload = {
+        # Return a primitive dictionary payload to keep process memory usage low
+        return student_id, {
             "x": node_features,
             "edge_index": edges,
             "edge_attr": edge_features,
             "text_document": " ".join([t for t in node_text_corpus if t])
         }
-        return student_id, payload
     except Exception as e:
         logging.error(f"Failed parsing worker pipeline for asset {student_id}: {e}")
         return student_id, None
 
 
 class CPGDataLoader:
-    """Memory-safe data manager that streams and extracts structural vocabularies in parallel."""
+    """Orchestrates parallel background file streaming and maps schema tokens."""
     def __init__(self, input_dir):
         self.input_dir = input_dir
         self.node_vocab = {}
         self.edge_vocab = {}
 
     def discover_vocabularies(self):
-        """Scans folder structure to dynamically configure structural index matrix sizes."""
+        """Scans all cohort target files to build continuous integer lookups for schemas."""
         node_labels = set()
         edge_labels = set()
         
@@ -106,8 +110,8 @@ class CPGDataLoader:
         self.edge_vocab = {label: idx + 1 for idx, label in enumerate(sorted(edge_labels))}
         self.edge_vocab['UNKNOWN'] = 0
 
-    def load_cohort(self, executed_successfully=True):
-        """Asynchronously stream, parse, and ingest 1000s of graph elements into PyG arrays simultaneously."""
+    def load_cohort(self, executed_successfully=True, bypass_slicing=False):
+        """Asynchronously parses and formats raw GraphML files using background workers."""
         cohort_data = {}
         if not executed_successfully or not os.path.exists(self.input_dir):
             return self._generate_dummy_cohort()
@@ -116,16 +120,15 @@ class CPGDataLoader:
         if not files:
             return self._generate_dummy_cohort()
 
-        logging.info(f"[PARALLEL LOADING] Ingesting {len(files)} GraphML structural logs...")
         max_workers = max(1, os.cpu_count() - 1)
-        tasks = [(f, self.node_vocab, self.edge_vocab) for f in files]
+        tasks = [(f, self.node_vocab, self.edge_vocab, bypass_slicing) for f in files]
 
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_load_and_slice_single_file, task): task for task in tasks}
             for future in as_completed(futures):
                 student_id, payload = future.result()
                 if payload:
-                    # Translate raw back-end serializations cleanly into PyG primitives on the main thread
+                    # Construct clean PyTorch Geometric primitives on the main thread
                     pyg_data = Data(
                         x=torch.tensor(payload["x"], dtype=torch.float),
                         edge_index=torch.tensor(payload["edge_index"], dtype=torch.long).t().contiguous()
