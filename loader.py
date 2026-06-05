@@ -5,14 +5,15 @@ import torch
 from torch_geometric.data import Data
 
 class CPGDataLoader:
-    """Handles loading flattened GraphML exports, dynamically discovering graph schemas, and translating them to PyG Data primitives."""
+    """Handles loading GraphML exports, executing contextual backward-slicing passes, 
+    and translating multi-relational subgraphs into PyG primitives."""
     def __init__(self, input_dir):
         self.input_dir = input_dir
         self.node_vocab = {}
         self.edge_vocab = {}
 
     def discover_vocabularies(self):
-        """First Pass: Scans all GraphML files to dynamically discover every unique node and edge label present in the dataset."""
+        """First Pass: Scans all GraphML files to dynamically discover every unique node and edge label."""
         node_labels = set()
         edge_labels = set()
         
@@ -33,56 +34,103 @@ class CPGDataLoader:
                 except Exception as e:
                     logging.warning(f"Vocab discovery pass skipped file {item}: {e}")
 
-        # Build dynamic, continuous integer mapping indexes (leaving 0 for unexpected fallbacks)
         self.node_vocab = {label: idx + 1 for idx, label in enumerate(sorted(node_labels))}
         self.node_vocab['UNKNOWN'] = 0
         
         self.edge_vocab = {label: idx + 1 for idx, label in enumerate(sorted(edge_labels))}
         self.edge_vocab['UNKNOWN'] = 0
         
-        logging.info(f"[SCHEMA DISCOVERY] Dynamically mapped {len(self.node_vocab)} node classes and {len(self.edge_vocab)} multi-relational edge types across the cohort.")
+        logging.info(f"[SCHEMA DISCOVERY] Dynamically mapped {len(self.node_vocab)} node classes and {len(self.edge_vocab)} multi-relational edge types.")
+
+    def execute_backward_slice(self, G):
+        """Topological Pass: Traces data/control dependencies backward from terminal outputs 
+        and captures immediate 1-hop AST neighbors to preserve architectural context."""
+        sinks = [n for n, attrs in G.nodes(data=True) if attrs.get('label', '').upper() in ['RETURN', 'METHOD_RETURN']]
+        
+        if not sinks:
+            sinks = [n for n in G.nodes() if G.out_degree(n) == 0]
+            
+        if not sinks:
+            return G
+            
+        sliced_nodes = set(sinks)
+        queue = list(sinks)
+        
+        while queue:
+            current = queue.pop(0)
+            for pred in G.predecessors(current):
+                edge_data = G.get_edge_data(pred, current)
+                is_valid_dependency = False
+                
+                for key in edge_data:
+                    edge_label = edge_data[key].get('label', '').upper()
+                    if edge_label in ['REACHING_DEF', 'CDG', 'CFG', 'DDG']:
+                        is_valid_dependency = True
+                        break
+                        
+                if is_valid_dependency and pred not in sliced_nodes:
+                    sliced_nodes.add(pred)
+                    queue.append(pred)
+                    
+        if len(sliced_nodes) < 3:
+            return G
+            
+        # Context Enrichment: Include 1-hop structural AST context nodes to prevent graph skeleton collapse
+        enriched_nodes = set(sliced_nodes)
+        for node in sliced_nodes:
+            for neighbor in G.neighbors(node):
+                edge_data = G.get_edge_data(node, neighbor)
+                for key in edge_data:
+                    if edge_data[key].get('label', '').upper() == 'AST':
+                        enriched_nodes.add(neighbor)
+                        
+        sliced_G = G.subgraph(enriched_nodes).copy()
+        
+        if sliced_G.number_of_edges() == 0:
+            return G
+            
+        return sliced_G
 
     def graphml_to_pyg(self, file_path):
-        """Parses a multi-relational Joern GraphML file, extracting all discovered relational and textual attributes."""
+        """Parses a Joern GraphML file, runs the context-aware backward-slicing pass, and encodes attributes."""
         try:
             G = nx.read_graphml(file_path)
             
-            # 1. Map Node Attributes against Discovered Vocab
+            # Execute contextual backward slice
+            G = self.execute_backward_slice(G)
+            
             node_features = []
             node_text_corpus = []
             
-            for node, attrs in G.nodes(data=True):
+            # Track explicit node key ordering mapping context
+            node_to_idx = {}
+            for idx, (node, attrs) in enumerate(G.nodes(data=True)):
+                node_to_idx[node] = idx
                 label = attrs.get('label', 'UNKNOWN').upper()
                 node_features.append([self.node_vocab.get(label, 0)])
                 
-                # Semantic Text Aggregation
                 node_name = attrs.get('name', '')
                 node_code = attrs.get('code', '')
-                combined_text = f"{label} {node_name} {node_code}".strip()
-                node_text_corpus.append(combined_text)
+                node_text_corpus.append(f"{node_name} {node_code}".strip())
             
-            # 2. Map Edge Attributes against Discovered Vocab
             edge_features = []
             edges = []
-            
             for u, v, attrs in G.edges(data=True):
-                edges.append((u, v))
-                edge_label = attrs.get('label', 'UNKNOWN').upper()
-                edge_features.append(self.edge_vocab.get(edge_label, 0))
+                if u in node_to_idx and v in node_to_idx:
+                    edges.append((node_to_idx[u], node_to_idx[v]))
+                    edge_label = attrs.get('label', 'UNKNOWN').upper()
+                    edge_features.append(self.edge_vocab.get(edge_label, 0))
 
-            G_int = nx.convert_node_labels_to_integers(G)
-            int_edges = list(G_int.edges())
-            
-            if len(int_edges) == 0:
+            if len(edges) == 0:
                 return None
                 
-            edge_index = torch.tensor(int_edges, dtype=torch.long).t().contiguous()
+            edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
             x_tensor = torch.tensor(node_features, dtype=torch.float)
             edge_attr_tensor = torch.tensor(edge_features, dtype=torch.long)
             
             pyg_data = Data(x=x_tensor, edge_index=edge_index)
             pyg_data.edge_attr = edge_attr_tensor
-            pyg_data.text_document = " ".join(node_text_corpus)
+            pyg_data.text_document = " ".join([t for t in node_text_corpus if t])
             
             return pyg_data
             
@@ -91,7 +139,7 @@ class CPGDataLoader:
             return None
 
     def load_cohort(self, executed_successfully=True):
-        """Scans the Joern output folder for single GraphML files to build the PyG cohort dataset."""
+        """Scans folder for single GraphML files to build the PyG cohort dataset."""
         cohort_data = {}
         if not executed_successfully or not os.path.exists(self.input_dir) or len(os.listdir(self.input_dir)) == 0:
             logging.warning("No real GraphML assets found. Pipeline defaulting to mock routines.")
@@ -111,8 +159,8 @@ class CPGDataLoader:
         cohort_data = {}
         for i in range(1, num_students + 1):
             edge_index = torch.tensor([[0, 1, 2], [1, 2, 0]], dtype=torch.long)
-            mock_data = Data(x=torch.ones((3, 1)), edge_index=edge_index)
+            mock_data = Data(x=torch.tensor([[1.0], [2.0], [3.0]], dtype=torch.float), edge_index=edge_index)
             mock_data.edge_attr = torch.tensor([1, 1, 1], dtype=torch.long)
-            mock_data.text_document = "METHOD func main() CALL println System.out.println"
+            mock_data.text_document = "public static void main String args System.out.println"
             cohort_data[f"Student_{i:02d}_Mock"] = mock_data
         return cohort_data

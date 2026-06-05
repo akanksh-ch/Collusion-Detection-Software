@@ -4,17 +4,20 @@ from sklearn.cluster import HDBSCAN
 from gnn import StructuralEncoder
 
 class CohortAnalyzer:
-    """Ingests per-submission graph vectors, processes textual structures, and groups lineages via HDBSCAN."""
+    """Ingests per-submission graph elements, processes structural representations, and groups lineages."""
     def __init__(self, cohort_data, node_vocab_size, edge_vocab_size):
         self.cohort_data = cohort_data
         self.student_ids = list(cohort_data.keys())
-        # --- FIX: Encoder initialized dynamically using explicit discovery matrix scales ---
         self.encoder = StructuralEncoder(node_vocab_size=node_vocab_size, edge_vocab_size=edge_vocab_size)
         self.embeddings = None
         self.similarity_matrix = None
 
     def generate_all_embeddings(self):
         """Extracts text vocabularies and encodes structural metrics across the entire student population."""
+        if not self.student_ids:
+            print("\n[CRITICAL ERROR] Cohort Analyzer contains zero valid student submissions.")
+            raise ValueError("Aborting pipeline execution: Cannot compute similarity matrix on empty inputs.")
+
         full_cohort_corpus = []
         for sid in self.student_ids:
             pyg_data = self.cohort_data[sid]
@@ -34,11 +37,21 @@ class CohortAnalyzer:
         print(f"\n[DIAGNOSTIC] Relational Metrics -> Min Sim: {self.similarity_matrix.min():.4f}, Max Sim: {self.similarity_matrix.max():.4f}, Mean: {self.similarity_matrix.mean():.4f}")
 
     def extract_solution_families(self, min_cluster_size=2):
-        """Clusters structural profiles, assigning copy lineages to groups and honest code to noise (-1)."""
+        """Clusters structural profiles using precomputed cosine distances. 
+        Forces loose baseline matches out into standard unassigned noise categories (-1)."""
         if len(self.embeddings) < min_cluster_size:
             return {f"Unique_Solution_{sid}": [sid] for sid in self.student_ids}
 
-        clustering = HDBSCAN(min_cluster_size=min_cluster_size, min_samples=1).fit(self.embeddings)
+        # Convert high-fidelity Cosine Similarity directly to bounded Distance Space [0.0 to 1.0]
+        cosine_distances = np.clip(1.0 - self.similarity_matrix, 0.0, 1.0)
+
+        # Configured to require high core connectivity density to drop out general prompt overlaps
+        clustering = HDBSCAN(
+            min_cluster_size=min_cluster_size, 
+            min_samples=min_cluster_size, 
+            metric='precomputed'
+        ).fit(cosine_distances)
+        
         labels = clustering.labels_
 
         families = {}
@@ -61,7 +74,7 @@ class CohortAnalyzer:
 
         for family_name, members in families.items():
             if len(members) <= 1 or "Unique_Solution" in family_name:
-                continue 
+                continue  
                 
             for i, student_a in enumerate(members):
                 for j in range(i + 1, len(members)):
@@ -69,7 +82,7 @@ class CohortAnalyzer:
                     idx_a, idx_b = id_to_idx[student_a], id_to_idx[student_b]
                     
                     global_score = float(self.similarity_matrix[idx_a, idx_b])
-                    family_scores = [self.similarity_matrix[id_to_idx[m1], id_to_idx[m2]] 
+                    family_scores = [self.similarity_matrix[id_to_idx[m1], id_to_idx[m2]]  
                                      for m1 in members for m2 in members if m1 != m2]
                     family_mean = float(np.mean(family_scores)) if family_scores else global_score
 
