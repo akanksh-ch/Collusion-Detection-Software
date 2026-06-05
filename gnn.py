@@ -14,8 +14,6 @@ class StructuralEncoder:
         self.wl_iterations = wl_iterations
         self.tfidf_disabled = False
         
-        # Switched to character-level word-bound n-grams to capture identifier substring patterns,
-        # brackets, spacing configurations, and syntax style fingerprints accurately.
         self.tfidf = TfidfVectorizer(
             analyzer='char_wb',
             ngram_range=(3, 5),
@@ -81,12 +79,12 @@ class StructuralEncoder:
         return wl_histogram
 
     def encode_submission(self, pyg_data):
-        """Transforms relational configurations, micro-scale absolute properties, and code sub-tokens 
-        into an isolated, highly distinctive unit-normalized 1D vector fingerprint."""
+        """Transforms relational configurations and text code sub-tokens into a single, 
+        monolithic, global unit-normalized 1D vector fingerprint."""
         # 1. Compute WL Graph Kernel Structural Histogram
         wl_topological_vector = self.compute_wl_topological_fingerprint(pyg_data)
 
-        # 2. Extract Macro Scale Metrics to mathematically split small vs large assignments
+        # 2. Extract Macro Scale Metrics
         num_nodes = pyg_data.x.size(0) if pyg_data.x is not None else 0
         num_edges = pyg_data.edge_index.size(1) if pyg_data.edge_index is not None else 0
         
@@ -115,5 +113,14 @@ class StructuralEncoder:
         if text_norm > 0:
             text_features = text_features / text_norm
 
-        # Balanced fingerprint vector (50% structural topology, 50% character style tokens)
-        return np.concatenate([structural_features, text_features])
+        # Combine components into a single array
+        combined_fingerprint = np.concatenate([structural_features, text_features])
+        
+        # --- CRITICAL FIX: Global Unit-Normalization ---
+        # Enforcing that the total L2-norm of the final vector is exactly 1.0 
+        # allows accelerated Euclidean space trees to perfectly mimic Cosine thresholds.
+        global_norm = np.linalg.norm(combined_fingerprint)
+        if global_norm > 0:
+            combined_fingerprint = combined_fingerprint / global_norm
+            
+        return combined_fingerprint

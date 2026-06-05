@@ -3,99 +3,107 @@ import glob
 import shutil
 import subprocess
 import logging
-import networkx as nx
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+def _parse_single_submission(args):
+    """Isolated worker function executed inside an independent process core."""
+    path, output_dir, parse_bin, export_bin = args
+    student_id = os.path.basename(path).replace(".java", "")
+    cpg_bin_path = os.path.join(output_dir, f"{student_id}_cpg.bin")
+    temp_stage_dir = os.path.join(output_dir, f"{student_id}_tmp_stage")
+    final_graphml_path = os.path.join(output_dir, f"{student_id}.graphml")
+
+    if os.path.exists(final_graphml_path):
+        return student_id, "CACHED"
+
+    try:
+        # Import NetworkX inside the worker process to avoid global context serialization locks
+        import networkx as nx
+
+        # 1. Compile source code to intermediate CPG binaries
+        subprocess.run([parse_bin, path, "--output", cpg_bin_path],  
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        # 2. Export CPG slice structures to raw XML datasets
+        subprocess.run([
+            export_bin, cpg_bin_path,  
+            "--repr", "cpg", "--format", "graphml", "--out", temp_stage_dir
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        # 3. Collapse XML slices into unified multi-relational graphs
+        xml_files = glob.glob(os.path.join(temp_stage_dir, "**", "export.xml"), recursive=True)
+        if xml_files:
+            unified_graph = nx.MultiDiGraph()
+            for xml_file in xml_files:
+                try:
+                    sub_graph = nx.read_graphml(xml_file)
+                    unified_graph = nx.compose(unified_graph, sub_graph)
+                except Exception:
+                    continue
+            
+            nx.write_graphml(unified_graph, final_graphml_path)
+            status = "SUCCESS"
+        else:
+            status = "EMPTY_EXPORT"
+
+    except subprocess.CalledProcessError as e:
+        status = f"FAILED_JOERN: {e.stderr.decode('utf-8', errors='ignore').strip()[:100]}"
+    except Exception as e:
+        status = f"FAILED_COMPOSITION: {str(e)}"
+    finally:
+        # Strict garbage collection cleanup of binary assets to protect disk I/O channels
+        if os.path.exists(cpg_bin_path):
+            os.remove(cpg_bin_path)
+        if os.path.exists(temp_stage_dir):
+            shutil.rmtree(temp_stage_dir)
+
+    return student_id, status
+
 
 class JoernAutomationParser:
-    """Automates Joern CLI commands and collapses structural slices into singular GraphML files."""
+    """Automates multi-processed asynchronous Joern compilation pipelines across 
+    all available hardware process cores."""
     def __init__(self, joern_path=""):
-        self.joern_path = joern_path
         self.parse_bin = os.path.join(joern_path, "joern-parse") if joern_path else "joern-parse"
         self.export_bin = os.path.join(joern_path, "joern-export") if joern_path else "joern-export"
 
     def process_submission_folder(self, source_dir, output_dir):
-        """
-        Iterates through source code files, generates intermediate CPG binaries,
-        and builds single monolithic directed GraphML files per student submission.
-        Skips processing if the target GraphML file already exists.
-        """
         os.makedirs(output_dir, exist_ok=True)
-        
         if not os.path.exists(source_dir):
             logging.error(f"Source directory '{source_dir}' does not exist.")
             return False
 
-        # Scan for student subdirectories or standalone Java code files
         items = [os.path.join(source_dir, x) for x in os.listdir(source_dir)]
         submissions = [x for x in items if os.path.isdir(x) or x.endswith('.java')]
 
         if not submissions:
-            logging.warning(f"No source submissions found in {source_dir}.")
+            logging.warning(f"No source submissions discovered inside {source_dir}.")
             return False
 
-        logging.info(f"Found {len(submissions)} submission(s) to scan/process via Joern.")
+        logging.info(f"[PARALLEL ORCHESTRATION] Submitting {len(submissions)} jobs to CPU Process Pool...")
 
-        for path in submissions:
-            student_id = os.path.basename(path).replace(".java", "")
-            cpg_bin_path = os.path.join(output_dir, f"{student_id}_cpg.bin")
+        # Safe Concurrency Ceiling: Spawns 1 less worker than total CPU cores to protect OS stability
+        max_workers = max(1, os.cpu_count() - 1)
+        worker_tasks = [
+            (path, output_dir, self.parse_bin, self.export_bin) 
+            for path in submissions
+        ]
+
+        success_count = 0
+        cached_count = 0
+
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_parse_single_submission, task): task for task in worker_tasks}
             
-            # Temporary folder for Joern's multi-file XML dump
-            temp_stage_dir = os.path.join(output_dir, f"{student_id}_tmp_stage")
-            # Final output destination: One big standalone file per student
-            final_graphml_path = os.path.join(output_dir, f"{student_id}.graphml")
-
-            # --- SMART CACHE SKIP CHECK ---
-            if os.path.exists(final_graphml_path):
-                logging.info(f"[{student_id}] Found existing GraphML export. Skipping Joern parsing pipeline.")
-                continue
-
-            try:
-                logging.info(f"[{student_id}] Compiling source code to CPG binary...")
-                subprocess.run([self.parse_bin, path, "--output", cpg_bin_path], 
-                               check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-                logging.info(f"[{student_id}] Exporting fragmented subgraphs to staging...")
-                subprocess.run([
-                    self.export_bin, 
-                    cpg_bin_path, 
-                    "--repr", "cpg", 
-                    "--format", "graphml", 
-                    "--out", temp_stage_dir
-                ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                
-                # --- MULTI-RELATIONAL COMPOSITION STEP ---
-                logging.info(f"[{student_id}] Aggregating all XML fragments into single GraphML dataset...")
-                xml_files = glob.glob(os.path.join(temp_stage_dir, "**", "export.xml"), recursive=True)
-                
-                if xml_files:
-                    unified_graph = nx.MultiDiGraph()
-                    
-                    for xml_file in xml_files:
-                        try:
-                            sub_graph = nx.read_graphml(xml_file)
-                            unified_graph = nx.compose(unified_graph, sub_graph)
-                        except Exception as slice_err:
-                            logging.warning(f"[{student_id}] Skipped parsing component slice {os.path.basename(xml_file)}: {slice_err}")
-                    
-                    # Write out the single unified GraphML file
-                    nx.write_graphml(unified_graph, final_graphml_path)
-                    logging.info(f"[{student_id}] Successfully generated: {final_graphml_path}")
+            for future in as_completed(futures):
+                student_id, status = future.result()
+                if status == "SUCCESS":
+                    success_count += 1
+                    logging.info(f"[{student_id}] Compilation successful.")
+                elif status == "CACHED":
+                    cached_count += 1
                 else:
-                    logging.warning(f"[{student_id}] No structural components were generated by the exporter.")
+                    logging.error(f"[{student_id}] Processing pipeline crashed: {status}")
 
-                # --- AUTO-CLEANUP STEP ---
-                if os.path.exists(cpg_bin_path):
-                    os.remove(cpg_bin_path)
-                if os.path.exists(temp_stage_dir):
-                    shutil.rmtree(temp_stage_dir)
-
-            except subprocess.CalledProcessError as e:
-                logging.error(f"Joern failed processing {student_id}. Error details:\n{e.stderr.decode('utf-8', errors='ignore')}")
-                if os.path.exists(cpg_bin_path): 
-                    os.remove(cpg_bin_path)
-                if os.path.exists(temp_stage_dir): 
-                    shutil.rmtree(temp_stage_dir)
-            except FileNotFoundError:
-                logging.error("Joern CLI utilities not detected on system PATH. Please verify your system setup.")
-                return False
-                
+        logging.info(f"[EXECUTION COMPLETE] Compiled: {success_count}, Cached skips: {cached_count} across {max_workers} active worker cores.")
         return True
