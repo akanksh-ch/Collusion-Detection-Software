@@ -70,6 +70,19 @@ class CohortAnalyzer:
                 
             id_to_idx = {sid: self.student_ids.index(sid) for sid in members}
             
+            # Compute the cluster cohesion metric (average similarity within the family)
+            pairwise_scores = []
+            for i, student_a in enumerate(members):
+                for j in range(i + 1, len(members)):
+                    student_b = members[j]
+                    vec_a = self.embeddings[id_to_idx[student_a]]
+                    vec_b = self.embeddings[id_to_idx[student_b]]
+                    score = float(np.dot(vec_a, vec_b))
+                    pairwise_scores.append(max(0.0, min(1.0, score)))
+            
+            family_density = float(np.mean(pairwise_scores)) if pairwise_scores else 0.0
+            
+            # Map structural components into distinct pairs using the evaluated density metric
             for i, student_a in enumerate(members):
                 for j in range(i + 1, len(members)):
                     student_b = members[j]
@@ -85,7 +98,7 @@ class CohortAnalyzer:
                         "student_a": student_a,
                         "student_b": student_b,
                         "similarity": global_score,
-                        "family_density": 0.0,
+                        "family_density": family_density,
                         "risk_level": "CRITICAL" if global_score > 0.85 else "HIGH"
                     })
                     
