@@ -52,9 +52,16 @@ def _load_and_slice_single_file(args):
         
         for idx, (node, attrs) in enumerate(G.nodes(data=True)):
             node_to_idx[node] = idx
-            label = attrs.get('label', 'UNKNOWN').upper()
+            
+            # Case-Insensitive Key Matching for Node Types (checks 'labelV' then 'label')
+            raw_label = attrs.get('labelV', attrs.get('label', 'UNKNOWN'))
+            label = str(raw_label).upper()
             node_features.append([node_vocab.get(label, 0)])
-            node_text_corpus.append(f"{attrs.get('name', '')} {attrs.get('code', '')}".strip())
+            
+            # Case-Insensitive Key Matching for Source Identifiers and Code Texts
+            node_name = attrs.get('NAME', attrs.get('name', ''))
+            node_code = attrs.get('CODE', attrs.get('code', ''))
+            node_text_corpus.append(f"{node_name} {node_code}".strip())
         
         edges = []
         edge_features = []
@@ -99,9 +106,14 @@ class CPGDataLoader:
                 try:
                     G = nx.read_graphml(os.path.join(self.input_dir, item))
                     for _, attrs in G.nodes(data=True):
-                        if 'label' in attrs: node_labels.add(attrs['label'].upper())
+                        # Support both labelV and label keys during discovery loop
+                        raw_label = attrs.get('labelV', attrs.get('label'))
+                        if raw_label: 
+                            node_labels.add(str(raw_label).upper())
+                            
                     for _, _, attrs in G.edges(data=True):
-                        if 'label' in attrs: edge_labels.add(attrs['label'].upper())
+                        if 'label' in attrs: 
+                            edge_labels.add(attrs['label'].upper())
                 except Exception:
                     continue
 
