@@ -8,7 +8,11 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 def _parse_single_submission(args):
     """Isolated worker function executed inside an independent process core."""
     path, output_dir, parse_bin, export_bin = args
-    student_id = os.path.basename(path).replace(".java", "")
+    
+    # Extract file/folder stem dynamically to preserve native naming
+    base_file_name = os.path.basename(path)
+    student_id, _ = os.path.splitext(base_file_name)
+    
     cpg_bin_path = os.path.join(output_dir, f"{student_id}_cpg.bin")
     temp_stage_dir = os.path.join(output_dir, f"{student_id}_tmp_stage")
     final_graphml_path = os.path.join(output_dir, f"{student_id}.graphml")
@@ -20,7 +24,7 @@ def _parse_single_submission(args):
         # Import NetworkX inside the worker process to avoid global context serialization locks
         import networkx as nx
 
-        # 1. Compile source code to intermediate CPG binaries
+        # 1. Compile source asset directly using Joern's native frontend auto-detection
         subprocess.run([parse_bin, path, "--output", cpg_bin_path],  
                        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -74,13 +78,29 @@ class JoernAutomationParser:
             return False
 
         items = [os.path.join(source_dir, x) for x in os.listdir(source_dir)]
-        submissions = [x for x in items if os.path.isdir(x) or x.endswith('.java')]
+        
+        # Filter out common environmental, documentation, and metadata files
+        IGNORED_EXTENSIONS = ('.md', '.txt', '.json', '.yml', '.yaml', '.xml', '.html', '.gitignore')
+        
+        submissions = []
+        for x in items:
+            base = os.path.basename(x)
+            
+            # Skip hidden files/directories (like .DS_Store, .git, or .joern)
+            if base.startswith('.'):
+                continue
+                
+            # Skip documentation or non-code configurations if it's a plain file
+            if os.path.isfile(x) and base.lower().endswith(IGNORED_EXTENSIONS):
+                continue
+                
+            submissions.append(x)
 
         if not submissions:
-            logging.warning(f"No source submissions discovered inside {source_dir}.")
+            logging.warning(f"No valid source submissions discovered inside {source_dir}.")
             return False
 
-        logging.info(f"[PARALLEL ORCHESTRATION] Submitting {len(submissions)} jobs to CPU Process Pool...")
+        logging.info(f"[PARALLEL ORCHESTRATION] Submitting {len(submissions)} targets to CPU Process Pool...")
 
         # Safe Concurrency Ceiling: Spawns 1 less worker than total CPU cores to protect OS stability
         max_workers = max(1, os.cpu_count() - 1)
