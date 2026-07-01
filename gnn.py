@@ -5,15 +5,18 @@ import hashlib
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 class StructuralEncoder:
-    """Generates composite embeddings combining structural graph shapes and textual style profiles."""
-    def __init__(self, node_vocab_size, edge_vocab_size, wl_buckets=128, wl_iterations=2):
+    """
+    Generates balanced composite vector embeddings tracking local graph topology 
+    and stylometric layout profiles without risking feature component dilution.
+    """
+    def __init__(self, node_vocab_size, edge_vocab_size, wl_buckets=512, wl_iterations=3):
         self.node_vocab_size = node_vocab_size
         self.edge_vocab_size = edge_vocab_size
         self.wl_buckets = wl_buckets
         self.wl_iterations = wl_iterations
         self.tfidf_disabled = False
         
-        # Character-level n-gram capture to model indentation and code structure habits
+        # Capture structural code layouts and formatting habits via character-level n-grams
         self.tfidf = TfidfVectorizer(
             analyzer='char_wb',
             ngram_range=(3, 5),
@@ -33,7 +36,7 @@ class StructuralEncoder:
             self.tfidf_disabled = True
 
     def compute_wl_topological_fingerprint(self, pyg_data):
-        """Generates topological hashes invariant to simple renaming and variable refactoring."""
+        """Generates localized node neighborhood hashes invariant to variable identifier renaming."""
         num_nodes = pyg_data.x.size(0) if pyg_data.x is not None else 0
         if num_nodes == 0:
             return np.zeros(self.wl_buckets)
@@ -45,12 +48,11 @@ class StructuralEncoder:
         
         wl_histogram = np.zeros(self.wl_buckets)
 
-        # Baseline assignment pass
         for c in node_colors:
             bucket = int(hashlib.md5(c.encode('utf-8')).hexdigest(), 16) % self.wl_buckets
             wl_histogram[bucket] += 1
 
-        # Iterative structural color refinement loop
+        # Multi-stage neighborhood feature aggregation loop
         for _ in range(self.wl_iterations):
             adjacency_map = {i: [] for i in range(num_nodes)}
             for idx in range(edge_index.shape[1]):
@@ -72,19 +74,20 @@ class StructuralEncoder:
                 
             node_colors = np.array(new_colors)
 
-        total_elements = np.sum(wl_histogram)
-        if total_elements > 0:
-            wl_histogram = wl_histogram / total_elements
+        # Apply L2 normalization to preserve structural magnitude scaling boundaries
+        wl_norm = np.linalg.norm(wl_histogram)
+        if wl_norm > 0:
+            wl_histogram = wl_histogram / wl_norm
 
         return wl_histogram
 
     def encode_submission(self, pyg_data, alpha=0.5):
-        """Assembles and scales architectural shapes and style metrics into a single unit vector."""
+        """Transforms structural graph properties and lexical style metrics into a unified vector."""
         
-        # 1. Structural Weisfeiler-Lehman Extraction
+        # 1. Structural Weisfeiler-Lehman signature extraction
         wl_topological_vector = self.compute_wl_topological_fingerprint(pyg_data)
 
-        # 2. Extract Macro Topological Dimensions
+        # 2. Extract and independently normalize macro graph dimensions
         num_nodes = pyg_data.x.size(0) if pyg_data.x is not None else 0
         num_edges = pyg_data.edge_index.size(1) if pyg_data.edge_index is not None else 0
         scale_invariants = np.array([
@@ -93,12 +96,17 @@ class StructuralEncoder:
             (num_edges / num_nodes) if num_nodes > 0 else 0.0
         ])
 
+        scale_norm = np.linalg.norm(scale_invariants)
+        if scale_norm > 0:
+            scale_invariants = scale_invariants / scale_norm
+
+        # Join fine-grained and macro structural elements into a balanced topology profile
         structural_features = np.concatenate([wl_topological_vector, scale_invariants])
         struct_norm = np.linalg.norm(structural_features)
         if struct_norm > 0:
             structural_features = structural_features / struct_norm
 
-        # 3. Lexical Stylometry Token Extraction
+        # 3. Extract and normalize lexical stylometry properties
         text_document = getattr(pyg_data, 'text_document', '')
         if text_document and not self.tfidf_disabled and hasattr(self.tfidf, 'vocabulary_'):
             try:
@@ -112,12 +120,11 @@ class StructuralEncoder:
         if text_norm > 0:
             text_features = text_features / text_norm
 
-        # Apply root scaling coefficients to project orthogonal fields onto an L2 unit circle
+        # Apply root-coefficient projections to align orthogonal domains onto an L2 unit circle
         scaled_structural = np.sqrt(alpha) * structural_features
         scaled_text = np.sqrt(1.0 - alpha) * text_features
         combined_fingerprint = np.concatenate([scaled_structural, scaled_text])
         
-        # Enforce exact unit normalization to allow accelerated Euclidean tree lookups
         global_norm = np.linalg.norm(combined_fingerprint)
         if global_norm > 0:
             combined_fingerprint = combined_fingerprint / global_norm
