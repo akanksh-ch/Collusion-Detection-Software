@@ -1,15 +1,14 @@
 import numpy as np
 import networkx as nx
 import faiss
+import logging
 from gnn import StructuralEncoder
 
 class CohortAnalyzer:
     """
-    Orchestrates cohort embedding generation, constructs a sparse K-Nearest Neighbor
-    similarity graph using an approximate HNSW index, and partitions the network into 
-    communities representing distinct algorithmic approaches using the Louvain algorithm.
+    Orchestrates spatial profiling workflows, maps neighborhoods using accelerated
+    approximate HNSW structures, and segments clusters via Leiden or Louvain partitioning.
     """
-    
     def __init__(self, cohort_data, node_vocab_size, edge_vocab_size):
         self.cohort_data = cohort_data
         self.student_ids = list(cohort_data.keys())
@@ -19,10 +18,7 @@ class CohortAnalyzer:
         self.node_to_community = {}
 
     def generate_all_embeddings(self, alpha=0.5):
-        """
-        Extracts textual and structural properties across all submissions to generate
-        unit-normalized hybrid embedding vectors.
-        """
+        """Transforms structural layout states into L2 unit-normalized hybrid embeddings."""
         if not self.student_ids:
             raise ValueError("Cannot generate embeddings: Cohort dataset is empty.")
 
@@ -41,47 +37,40 @@ class CohortAnalyzer:
         
         self.embeddings = np.array(embeddings_list)
 
-    def extract_solution_families(self, knn_k=3, **kwargs):
+    def extract_solution_families(self, knn_k=4, use_leiden=True, **kwargs):
         """
-        Constructs a sparse similarity graph using a Hierarchical Navigable Small World 
-        (HNSW) approximate index and identifies structural families via Louvain community detection.
+        Groups cohort submissions into distinct structural solution groups by building 
+        an HNSW approximate graph index and applying edge-pruned community detection.
         """
         num_students = len(self.student_ids)
         self.knn_graph = nx.Graph()
         self.node_to_community = {}
 
         if num_students < 2:
-            return {f"Community_{sid}": [sid] for sid in self.student_ids}
+            return {f"Solution_Family_{idx + 1}": [sid] for idx, sid in enumerate(self.student_ids)}
 
         effective_k = min(knn_k, num_students - 1)
 
         for sid in self.student_ids:
             self.knn_graph.add_node(sid)
 
-        # FAISS requires contiguous float32 arrays for optimized lower-level C++ execution
         embeddings_f32 = np.ascontiguousarray(self.embeddings.astype('float32'))
         dimension = embeddings_f32.shape[1]
 
-        # Initialize an uncompressed HNSW index mapping L2 Euclidean distance.
-        # 32 represents the number of bi-directional link connections constructed per node.
         index = faiss.IndexHNSWFlat(dimension, 32)
         index.add(embeddings_f32)
 
-        # Query the hierarchical graph index for approximate nearest neighborhoods in O(log N) time.
-        # Minimizing Euclidean distance on unit-normalized vectors directly optimizes cosine similarity.
+        # Search nearest neighborhoods in logarithmic O(log N) runtime
         _, indices = index.search(embeddings_f32, effective_k + 1)
 
         for idx, student_id in enumerate(self.student_ids):
             neighbor_indices = indices[idx]
             
             for nb_idx in neighbor_indices:
-                # FAISS can return -1 pads if a query requests more neighbors than existing nodes
                 if nb_idx == -1:
                     continue
                     
                 neighbor_id = self.student_ids[nb_idx]
-                
-                # Prevent self-loop generation caused by perfect spatial distance ties at 0.0
                 if student_id == neighbor_id:
                     continue
                 
@@ -90,39 +79,83 @@ class CohortAnalyzer:
                 similarity = float(np.dot(vec_a, vec_b))
                 similarity = max(0.0, min(1.0, similarity))
 
+                # Discard connections below the background noise threshold to separate independent submissions
+                if similarity < 0.92:
+                    continue
+
                 if self.knn_graph.has_edge(student_id, neighbor_id):
                     current_w = self.knn_graph[student_id][neighbor_id]['weight']
                     self.knn_graph[student_id][neighbor_id]['weight'] = max(current_w, similarity)
                 else:
                     self.knn_graph.add_edge(student_id, neighbor_id, weight=similarity)
 
-        try:
-            communities_list = nx.community.louvain_communities(self.knn_graph, weight='weight', seed=42)
-        except Exception:
-            communities_list = [set(self.student_ids)]
-
         families = {}
-        for comm_idx, community_nodes in enumerate(communities_list):
-            family_name = f"Solution_Family_{comm_idx + 1}"
-            families[family_name] = sorted(list(community_nodes))
-            
-            for node in community_nodes:
+        
+        if use_leiden:
+            try:
+                import igraph as ig
+                import leidenalg as la
+                
+                # Unpack active NetworkX nodes into an isolated igraph data footprint structure
+                ig_graph = ig.Graph(directed=False)
+                ig_graph.vs["name"] = self.student_ids
+                name_to_vidx = {name: i for i, name in enumerate(self.student_ids)}
+                
+                edges_to_add = []
+                weights_to_add = []
+                for u, v, d in self.knn_graph.edges(data=True):
+                    edges_to_add.append((name_to_vidx[u], name_to_vidx[v]))
+                    weights_to_add.append(d['weight'])
+                
+                if edges_to_add:
+                    ig_graph.add_edges(edges_to_add)
+                    ig_graph.es["weight"] = weights_to_add
+                
+                # Execute Leiden optimization using an enriched Modularity partition metric.
+                # A resolution parameter of 1.4 forces dense background baseline cliques to split.
+                partition = la.find_partition(
+                    ig_graph, 
+                    la.ModularityVertexPartition, 
+                    weights='weight' if edges_to_add else None,
+                    resolution_parameter=1.4
+                )
+                
+                for comm_idx, community_nodes in enumerate(partition):
+                    family_name = f"Solution_Family_{comm_idx + 1}"
+                    members = [ig_graph.vs[n_idx]['name'] for n_idx in community_nodes]
+                    families[family_name] = sorted(members)
+                    
+            except Exception as e:
+                logging.warning(f"[LEIDEN ERROR] Reverting to Louvain community fallback engine: {e}")
+                use_leiden = False
+
+        if not use_leiden:
+            try:
+                # Apply high-resolution parameters to the Louvain algorithm pass
+                communities_list = nx.community.louvain_communities(
+                    self.knn_graph, weight='weight', seed=42, resolution=1.4
+                )
+            except Exception:
+                communities_list = [set(self.student_ids)]
+
+            for comm_idx, community_nodes in enumerate(communities_list):
+                family_name = f"Solution_Family_{comm_idx + 1}"
+                families[family_name] = sorted(list(community_nodes))
+
+        for family_name, members in families.items():
+            for node in members:
                 self.node_to_community[node] = family_name
 
         return families
 
     def compute_suspicion_scores(self, families=None):
-        """
-        Parses the sparse network graph edges to evaluate pairwise similarity and macro-community
-        density, returning prioritized anomalies exceeding the suspicion threshold.
-        """
+        """Evaluates pairwise relationships and outputs prioritized indicators exceeding suspicion limits."""
         report_data = []
         seen_pairs = set()
 
         if self.knn_graph is None or len(self.knn_graph.edges) == 0:
             return report_data
 
-        # Calculate macro-density for each community based on its internal active edges
         community_densities = {}
         if families:
             for family_name, members in families.items():
@@ -140,7 +173,6 @@ class CohortAnalyzer:
                 
             similarity = data['weight']
             
-            # Filter out low-level structural baselines to prevent reporting noise
             if similarity >= 0.85:
                 pair = tuple(sorted([u, v]))
                 if pair in seen_pairs:
