@@ -2,3 +2,4 @@ personal-docs/
 .obsidian
 out/
 .venv/
+__pycache__/
