@@ -41,25 +41,58 @@ def _strip_comments(source_text):
     return stripped, "\n".join(comments)
 
 
-def _preprocess_single_source(args):
-    """Strip comments from a single source file and write sidecar outputs."""
+def _preprocess_single_submission_worker(args):
+    """Strip comments from a single submission (file or directory) and write sidecar outputs."""
     src_path, stripped_dir, comments_dir = args
     basename = os.path.basename(src_path)
     stem, ext = os.path.splitext(basename)
 
+    if os.path.isdir(src_path):
+        stem = basename
+
+    IGNORED_EXTENSIONS = ('.md', '.txt', '.json', '.yml', '.yaml', '.xml',
+                          '.html', '.gitignore')
+
+    all_comments = []
+
     try:
-        with open(src_path, "r", encoding="utf-8", errors="replace") as f:
-            raw = f.read()
+        if os.path.isfile(src_path):
+            with open(src_path, "r", encoding="utf-8", errors="replace") as f:
+                raw = f.read()
 
-        stripped_code, comment_stream = _strip_comments(raw)
+            stripped_code, comment_stream = _strip_comments(raw)
 
-        stripped_path = os.path.join(stripped_dir, basename)
-        with open(stripped_path, "w", encoding="utf-8") as f:
-            f.write(stripped_code)
+            stripped_path = os.path.join(stripped_dir, basename)
+            with open(stripped_path, "w", encoding="utf-8") as f:
+                f.write(stripped_code)
+
+            all_comments.append(comment_stream)
+        elif os.path.isdir(src_path):
+            target_dir = os.path.join(stripped_dir, basename)
+            os.makedirs(target_dir, exist_ok=True)
+            for root, dirs, files in os.walk(src_path):
+                rel_path = os.path.relpath(root, src_path)
+                curr_target_dir = os.path.join(target_dir, rel_path) if rel_path != '.' else target_dir
+                os.makedirs(curr_target_dir, exist_ok=True)
+
+                for f_name in files:
+                    if f_name.startswith('.') or f_name.lower().endswith(IGNORED_EXTENSIONS):
+                        continue
+
+                    f_path = os.path.join(root, f_name)
+                    with open(f_path, "r", encoding="utf-8", errors="replace") as f:
+                        raw = f.read()
+
+                    stripped_code, comment_stream = _strip_comments(raw)
+                    if comment_stream.strip():
+                        all_comments.append(comment_stream)
+
+                    with open(os.path.join(curr_target_dir, f_name), "w", encoding="utf-8") as f:
+                        f.write(stripped_code)
 
         comments_path = os.path.join(comments_dir, f"{stem}_comments.txt")
         with open(comments_path, "w", encoding="utf-8") as f:
-            f.write(comment_stream)
+            f.write("\n".join(all_comments))
 
         return stem, "OK"
     except Exception as e:
@@ -73,6 +106,9 @@ def _parse_single_submission(args):
     # Extract file/folder stem dynamically to preserve native naming
     base_file_name = os.path.basename(path)
     student_id, _ = os.path.splitext(base_file_name)
+
+    if os.path.isdir(path):
+        student_id = base_file_name
 
     cpg_bin_path = os.path.join(output_dir, f"{student_id}_cpg.bin")
     temp_stage_dir = os.path.join(output_dir, f"{student_id}_tmp_stage")
@@ -182,7 +218,8 @@ class JoernAutomationParser:
             if item.startswith('.'):
                 continue
             full = os.path.join(source_dir, item)
-            if os.path.isfile(full) and not item.lower().endswith(IGNORED_EXTENSIONS):
+            # Accept both files and directories, excluding ignored file extensions for single files
+            if os.path.isdir(full) or (os.path.isfile(full) and not item.lower().endswith(IGNORED_EXTENSIONS)):
                 tasks.append((full, stripped_dir, comments_dir))
 
         if not tasks:
@@ -192,7 +229,7 @@ class JoernAutomationParser:
         max_workers = max(1, os.cpu_count() - 1)
         ok = 0
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_preprocess_single_source, t): t for t in tasks}
+            futures = {executor.submit(_preprocess_single_submission_worker, t): t for t in tasks}
             for future in as_completed(futures):
                 stem, status = future.result()
                 if status == "OK":
