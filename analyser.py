@@ -5,18 +5,21 @@ Implements Module 4 of the production specification:
   2. Forensic disaggregation: independent cos(V_topo), cos(V_text) per pair
   3. Greedy String Tiling line-level evidence generation
   4. Leiden community detection for collusion-network partitioning
+  5. Compressed persistence of forensics payloads
 """
 
 from __future__ import annotations
 
 import os
 import logging
+import gzip
+import json
 import numpy as np
 import networkx as nx
 import faiss
 
 from gnn import MultiModalEncoder
-from gst import tokenize_source, greedy_string_tiling, coverage_score, tiles_to_json
+from gst import tokenize_source, greedy_string_tiling, merge_neighboring_tiles, coverage_score, tiles_to_json
 from parse import JoernAutomationParser
 
 
@@ -59,9 +62,17 @@ class CohortAnalyzer:
     def generate_all_embeddings(self):
         """Generate V_topo, V_text, V_program for every student.
 
-        After encoding, applies isotropic mean-centering to all three
-        vector spaces to remove the common mode that makes frozen random
-        network outputs cluster in a narrow similarity band.
+        Calls ``encoder.fit_cohort()`` to fit the text encoder AND
+        freeze All-But-The-Top calibration parameters (cohort mean and
+        top-K principal components, with K determined dynamically from
+        the singular value spectrum).
+
+        Subsequent ``encode_submission()`` calls apply those frozen
+        parameters automatically — no per-batch refitting occurs.
+
+        The 0.85 similarity threshold used downstream is *not* derived
+        from calibration; it was tuned empirically via precision-recall
+        analysis against the labelled ground-truth corpus.
         """
         if not self.student_ids:
             raise ValueError("Cannot generate embeddings: Cohort dataset is empty.")
@@ -70,13 +81,16 @@ class CohortAnalyzer:
         stripped_texts = []
         comment_texts = []
         for sid in self.student_ids:
-            stripped_texts.append(self._read_stripped_source(sid))
+            src_dict = self._read_stripped_source(sid)
+            concat_src = "\n\n".join([f"// --- {f} ---\n{content}" for f, content in src_dict.items()])
+            stripped_texts.append(concat_src)
             comment_texts.append(self._read_comments(sid))
 
-        # Fit TF-IDF + SVD on the full cohort
-        self.encoder.fit_text_cohort(stripped_texts, comment_texts)
+        # Fit text encoder (TF-IDF + SVD) AND freeze isotropic
+        # calibration parameters (All-But-The-Top: mean + top-K PCs)
+        self.encoder.fit_cohort(self.cohort_data, stripped_texts, comment_texts)
 
-        # Encode each submission
+        # Re-encode every submission with calibration now active
         for idx, sid in enumerate(self.student_ids):
             pyg_data = self.cohort_data[sid]
             vecs = self.encoder.encode_submission(
@@ -86,13 +100,7 @@ class CohortAnalyzer:
             self.vectors_text[sid] = vecs["v_text"]
             self.vectors_program[sid] = vecs["v_program"]
 
-        # Mean-center all three vector spaces (isotropic calibration)
-        from gnn import MultiModalEncoder
-        self.vectors_topo = MultiModalEncoder.mean_center_vectors(self.vectors_topo)
-        self.vectors_text = MultiModalEncoder.mean_center_vectors(self.vectors_text)
-        self.vectors_program = MultiModalEncoder.mean_center_vectors(self.vectors_program)
-
-        # Rebuild the program embedding matrix from centered vectors
+        # Build the program embedding matrix from calibrated vectors
         self.embeddings = np.array(
             [self.vectors_program[sid] for sid in self.student_ids],
             dtype=np.float32,
@@ -105,7 +113,11 @@ class CohortAnalyzer:
         self,
         sim_floor: float = 0.85,
         leiden_resolution: float = 1.4,
-        gst_min_match: int = 8,
+        gst_min_match: int = 9,
+        match_merging: bool = True,
+        gap_size: int = 6,
+        neighbor_length: int = 2,
+        cluster_skip: bool = False,
         **kwargs,
     ):
         """Build HNSW index, flag candidate pairs, disaggregate scores,
@@ -131,8 +143,8 @@ class CohortAnalyzer:
         index = faiss.IndexHNSWFlat(dimension, 32)
         index.add(embeddings_f32)
 
-        # All-pairs: query every vector, retrieve all neighbours
-        k_search = min(num_students, num_students)
+        # All-pairs: query every vector, retrieve a bounded local neighborhood
+        k_search = min(num_students, 32)
         _, indices = index.search(embeddings_f32, k_search)
 
         # ── Build similarity edges ───────────────────────────────────
@@ -171,15 +183,23 @@ class CohortAnalyzer:
                 sim_lexical = max(0.0, min(1.0, sim_lexical))
 
                 # ── GST line-level evidence ──────────────────────────
-                src_a = self._read_stripped_source(student_id)
-                src_b = self._read_stripped_source(neighbor_id)
+                # Use pair[0]/pair[1] (sorted) so a_file/b_file align
+                # with student_a/student_b in the report output.
+                src_a = self._read_stripped_source(pair[0])
+                src_b = self._read_stripped_source(pair[1])
 
                 gst_tiles = []
                 gst_coverage = 0.0
-                if src_a.strip() and src_b.strip():
+                if src_a and src_b:
                     tokens_a = tokenize_source(src_a)
                     tokens_b = tokenize_source(src_b)
                     tiles = greedy_string_tiling(tokens_a, tokens_b, gst_min_match)
+                    if match_merging:
+                        tiles = merge_neighboring_tiles(
+                            tiles, tokens_a, tokens_b,
+                            max_gap=gap_size,
+                            min_neighbor_length=neighbor_length,
+                        )
                     gst_coverage = coverage_score(tiles, len(tokens_a), len(tokens_b))
                     gst_tiles = tiles_to_json(tiles)
 
@@ -193,6 +213,16 @@ class CohortAnalyzer:
                 )
 
         # ── Leiden community detection ───────────────────────────────
+        if cluster_skip:
+            # Assign each student to their own family
+            families = {}
+            for i, sid in enumerate(self.student_ids):
+                families[f"Solution_Family_{i + 1}"] = [sid]
+            for family_name, members in families.items():
+                for node in members:
+                    self.node_to_community[node] = family_name
+            return families
+
         ig_graph = ig.Graph(n=num_students, directed=False)
         ig_graph.vs["name"] = self.student_ids
         name_to_vidx = {name: i for i, name in enumerate(self.student_ids)}
@@ -305,26 +335,104 @@ class CohortAnalyzer:
         return report_data
 
     # ------------------------------------------------------------------
+    # Step 4: Standalone Forensic Archive Exporter
+    # ------------------------------------------------------------------
+    def save_results_archive(self, output_path: str = "results.json.gz", **kwargs):
+        """Orchestrates pipeline execution, structures results, embeds raw source
+        strings, and exports an optimized compressed JSON file to disk."""
+        logging.info("Extracting solution families via Leiden...")
+        families = self.extract_solution_families(**kwargs)
+        
+        logging.info("Computing metrics and extracting line-level matching tiles...")
+        report_data = self.compute_suspicion_scores(families=families)
+        
+        logging.info("Mapping and serializing source files for offline viewer compatibility...")
+        source_texts = {sid: self._read_original_source(sid) for sid in self.student_ids}
+
+        archive_payload = {
+            "metadata": {
+                "total_submissions": len(self.student_ids),
+                "flagged_pairs_count": len(report_data),
+                "isolated_clusters_count": len(families)
+            },
+            "families": families,
+            "report_data": report_data,
+            "source_texts": source_texts
+        }
+
+        with gzip.open(output_path, "wt", encoding="utf-8") as f:
+            json.dump(archive_payload, f, indent=2)
+            
+        logging.info(f"Successfully flushed pipeline metrics archive to: {output_path}")
+
+    # ------------------------------------------------------------------
     # Private helpers: source / comment file reading
     # ------------------------------------------------------------------
-    def _read_stripped_source(self, student_id: str) -> str:
-        """Try to read the comment-stripped source file.  Falls back to the
+    def _read_stripped_source(self, student_id: str) -> dict[str, str]:
+        """Try to read the comment-stripped source file. Falls back to the
         original submission if the stripped version doesn't exist."""
+        stripped_base = os.path.join(self.workspace_dir, "_stripped", student_id)
+        if os.path.isdir(stripped_base):
+            return self._read_dir_files(stripped_base, stripped_base)
+            
         stripped = JoernAutomationParser.get_stripped_source_path(
             self.workspace_dir, student_id
         )
         if os.path.isfile(stripped):
             with open(stripped, "r", encoding="utf-8", errors="replace") as f:
-                return f.read()
+                return {os.path.basename(stripped): f.read()}
 
-        # Fallback: try common extensions in the original submissions dir
+        # Fallback: try original submissions dir
+        return self._read_original_source(student_id)
+
+    def _read_original_source(self, student_id: str) -> dict[str, str]:
+        orig_dir = os.path.join(self.source_dir, student_id)
+        if os.path.isdir(orig_dir):
+            return self._read_dir_files(orig_dir, orig_dir)
+
         for ext in (".java", ".c", ".cpp", ".py"):
             orig = os.path.join(self.source_dir, f"{student_id}{ext}")
             if os.path.isfile(orig):
                 with open(orig, "r", encoding="utf-8", errors="replace") as f:
-                    return f.read()
+                    return {os.path.basename(orig): f.read()}
 
-        return ""
+        return {}
+
+    def _read_dir_files(self, directory: str, base_dir: str) -> dict[str, str]:
+        IGNORED_EXTENSIONS = ('.md', '.txt', '.json', '.yml', '.yaml', '.xml',
+                              '.html', '.gitignore', '.class')
+        files_dict = {}
+        # Keep track of where a basename originally came from to fix collisions
+        basename_to_relpath = {}
+        
+        for root, _, files in os.walk(directory):
+            for f in sorted(files):
+                if f.startswith('.') or f.lower().endswith(IGNORED_EXTENSIONS):
+                    continue
+                path = os.path.join(root, f)
+                rel_path = os.path.relpath(path, base_dir)
+                rel_path = rel_path.replace(os.sep, "/")
+                
+                # JPlag viewer prefers flat file names (just the basename)
+                basename = os.path.basename(rel_path)
+                
+                with open(path, "r", encoding="utf-8", errors="replace") as file:
+                    content = file.read()
+                    
+                # Handle name collisions
+                if basename in files_dict:
+                    # A collision occurred! Revert the previous one to its full path
+                    old_rel_path = basename_to_relpath[basename]
+                    if old_rel_path != basename: # don't overwrite if it was already flat
+                        files_dict[old_rel_path] = files_dict.pop(basename)
+                    
+                    # Store the new one with its full path
+                    files_dict[rel_path] = content
+                else:
+                    files_dict[basename] = content
+                    basename_to_relpath[basename] = rel_path
+                    
+        return files_dict
 
     def _read_comments(self, student_id: str) -> str:
         """Read the isolated comment stream sidecar file."""
