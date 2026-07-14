@@ -307,11 +307,19 @@ class MultiModalEncoder:
     so that the analyser can perform forensic disaggregation on the
     decoupled components.
 
-    Post-processing: after encoding the full cohort, call
-    ``mean_center_cohort()`` to remove the common mode from all vectors.
-    This is standard practice in embedding-based retrieval and prevents
-    frozen random networks from collapsing cosine similarities into a
-    narrow band.
+    Calibration strategy (All-But-The-Top):
+      During ``fit_cohort()`` we compute and permanently freeze:
+        1. The cohort mean vector for each embedding space.
+        2. The top-K dominant principal components (K determined
+           dynamically from the singular value spectrum).
+      During ``encode_submission()`` we apply those frozen parameters
+      to incoming vectors: subtract the mean, project out the top-K
+      PCs, and re-normalise.  No per-batch refitting occurs.
+
+      This guarantees that isotropic calibration only stabilises the
+      cosine distance metric; the similarity threshold (e.g. 0.85) is
+      derived empirically via precision-recall tuning against the
+      labelled ground-truth corpus.
     """
 
     def __init__(
@@ -343,15 +351,109 @@ class MultiModalEncoder:
         for param in self.fusion.parameters():
             param.requires_grad = False
 
+        # ── Frozen calibration state (set by fit_cohort) ─────────────
+        self._calibrated: bool = False
+        self._cohort_mean: dict[str, np.ndarray] = {}    # space → mean vec
+        self._cohort_top_pcs: dict[str, np.ndarray] = {} # space → (K, D) PC matrix
+
     def fit_text_cohort(
         self,
         stripped_texts: list[str],
         comment_texts: list[str] | None = None,
     ):
-        """Fit the text encoder's TF-IDF + SVD on the cohort corpus."""
+        """Fit the text encoder's TF-IDF + SVD on the cohort corpus.
+
+        .. deprecated:: Use ``fit_cohort`` instead, which also computes
+           and freezes isotropic calibration parameters.
+        """
         if comment_texts is None:
             comment_texts = [""] * len(stripped_texts)
         self.text_encoder.fit_cohort(stripped_texts, comment_texts)
+
+    # ------------------------------------------------------------------
+    # Stateful cohort calibration (All-But-The-Top)
+    # ------------------------------------------------------------------
+    def fit_cohort(
+        self,
+        cohort_pyg: dict,
+        stripped_texts: list[str],
+        comment_texts: list[str],
+    ):
+        """Fit all learnable parameters AND freeze calibration state.
+
+        This method:
+          1. Fits the lexical encoder's TF-IDF + SVD.
+          2. Encodes every submission (uncalibrated).
+          3. For each vector space (v_topo, v_text, v_program):
+             a. Computes and stores the cohort mean.
+             b. Inspects the singular value spectrum of the centred
+                matrix to dynamically determine K — the number of
+                dominant principal components to remove.
+             c. Stores the top-K PCs.
+          4. Sets ``_calibrated = True``.
+
+        After this call, ``encode_submission`` will automatically apply
+        the frozen calibration parameters to every new vector.
+        """
+        student_ids = list(cohort_pyg.keys())
+
+        # Step 1 — fit the text encoder's TF-IDF + SVD
+        self.fit_text_cohort(stripped_texts, comment_texts)
+
+        # Step 2 — encode the entire cohort (uncalibrated)
+        raw_vecs: dict[str, dict[str, np.ndarray]] = {}
+        for idx, sid in enumerate(student_ids):
+            raw_vecs[sid] = self.encode_submission(
+                cohort_pyg[sid], stripped_texts[idx], comment_texts[idx],
+            )
+
+        # Step 3 — compute calibration parameters per vector space
+        for space in ("v_topo", "v_text", "v_program"):
+            mat = np.stack([raw_vecs[sid][space] for sid in student_ids])
+            mean = mat.mean(axis=0)
+            self._cohort_mean[space] = mean
+
+            centred = mat - mean[np.newaxis, :]
+
+            # SVD on the centred matrix to inspect the spectrum
+            n, d = centred.shape
+            max_components = min(n, d)
+            if max_components < 2:
+                self._cohort_top_pcs[space] = np.empty((0, d), dtype=np.float32)
+                logging.info(
+                    f"[CALIBRATION] {space}: too few samples for spectrum "
+                    f"analysis — skipping PC removal."
+                )
+                continue
+
+            U, S, Vt = np.linalg.svd(centred, full_matrices=False)
+            explained = (S ** 2) / np.sum(S ** 2)
+
+            # Dynamically decide K: drop components whose explained
+            # variance ratio exceeds the isotropy expectation by ≥3×.
+            # For a perfectly isotropic D-dimensional space each PC
+            # would explain 1/D of the variance.
+            iso_baseline = max(3.0 * (1.0 / d), 0.05)
+            K = 0
+            for k_idx in range(min(3, len(explained))):
+                if explained[k_idx] > iso_baseline:
+                    K = k_idx + 1
+                else:
+                    break
+
+            self._cohort_top_pcs[space] = Vt[:K].astype(np.float32)
+
+            # Logging for dissertation evidence
+            top_vals = ", ".join(f"{v:.4f}" for v in explained[:5])
+            logging.info(
+                f"[CALIBRATION] {space}: singular value spectrum "
+                f"(top-5 explained variance): [{top_vals}]  →  "
+                f"dropping K={K} dominant PC(s)  "
+                f"(isotropy baseline: {iso_baseline:.4f})"
+            )
+
+        self._calibrated = True
+        logging.info("[CALIBRATION] Frozen calibration parameters stored.")
 
     def encode_submission(
         self,
@@ -360,6 +462,10 @@ class MultiModalEncoder:
         comment_text: str = "",
     ) -> dict:
         """Encode a single submission → decoupled + fused vectors.
+
+        If ``fit_cohort`` has been called, the frozen calibration
+        parameters (mean subtraction + top-K PC removal) are applied
+        automatically.  No per-batch refitting occurs.
 
         Returns dict with ``v_topo``, ``v_text``, ``v_program`` —
         each an L2-normalised ``np.ndarray`` of shape ``(D,)``.
@@ -401,19 +507,57 @@ class MultiModalEncoder:
         if norm > 0:
             v_program = v_program / norm
 
-        return {
+        result = {
             "v_topo": v_topo.astype(np.float32),
             "v_text": v_text.astype(np.float32),
             "v_program": v_program.astype(np.float32),
         }
 
+        # Apply frozen calibration if available
+        if self._calibrated:
+            for space in ("v_topo", "v_text", "v_program"):
+                result[space] = self._apply_calibration(
+                    result[space], space
+                )
+
+        return result
+
+    def _apply_calibration(
+        self, vec: np.ndarray, space: str,
+    ) -> np.ndarray:
+        """Apply frozen All-But-The-Top calibration to a single vector.
+
+        Steps:
+          1. Subtract the cohort mean for this space.
+          2. Remove the projections onto the top-K principal components.
+          3. L2-normalise.
+
+        This uses only the parameters frozen during ``fit_cohort``;
+        no per-batch refitting occurs.
+        """
+        vec = vec - self._cohort_mean[space]
+
+        top_pcs = self._cohort_top_pcs[space]  # (K, D) or (0, D)
+        if top_pcs.shape[0] > 0:
+            # Project out dominant directions:
+            #   v' = v - Σ_k (v · pc_k) pc_k
+            projections = top_pcs @ vec           # (K,)
+            vec = vec - top_pcs.T @ projections   # (D,)
+
+        norm = np.linalg.norm(vec)
+        if norm > 1e-8:
+            vec = vec / norm
+
+        return vec.astype(np.float32)
+
     @staticmethod
     def mean_center_vectors(vectors: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         """Remove the common mode from a cohort of vectors and re-normalise.
 
-        This is the standard isotropic calibration step used in
-        embedding-based retrieval to prevent frozen/untrained networks
-        from producing cosine similarities clustered in a narrow band.
+        .. deprecated:: Superseded by the stateful ``fit_cohort`` +
+           ``_apply_calibration`` pipeline which also removes dominant
+           principal components (All-But-The-Top).  Retained for
+           backward compatibility.
 
         Args:
             vectors: mapping ``student_id → vector (D,)``
