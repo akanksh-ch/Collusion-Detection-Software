@@ -216,9 +216,66 @@ def main():
 
     # ── Step 2: Vocabulary discovery + graph loading ──────────────────
     logging.info("Step 2: Loading and processing code property graphs...")
+
+    # ── Automatic Skeleton Compilation on the Fly ─────────────────────
+    skeleton_graphml_path = args.skeleton
+    if args.skeleton:
+        if args.skeleton.endswith(".graphml"):
+            skeleton_graphml_path = args.skeleton
+        else:
+            # Extract stem to look for pre-existing compiled files in workspace
+            base_name = os.path.basename(args.skeleton.rstrip("/\\"))
+            stem, _ = os.path.splitext(base_name)
+            candidate_graphml = os.path.join(workspace_dir, f"{stem}.graphml")
+            
+            if os.path.exists(candidate_graphml):
+                logging.info(f"[MASKING] Found pre-compiled GraphML for skeleton: {candidate_graphml}")
+                skeleton_graphml_path = candidate_graphml
+            else:
+                logging.info(f"[MASKING] Raw skeleton detected: '{args.skeleton}'. Compiling on the fly...")
+                
+                # Setup skeleton-specific stage folders
+                skel_stripped_dir = os.path.join(workspace_dir, "_stripped_skeleton")
+                skel_comments_dir = os.path.join(workspace_dir, "_comments_skeleton")
+                os.makedirs(skel_stripped_dir, exist_ok=True)
+                os.makedirs(skel_comments_dir, exist_ok=True)
+                
+                # Synchronously run workers since we only need to parse one skeleton
+                from parse import _preprocess_single_submission_worker, _parse_single_submission
+                
+                # Step A: Preprocess (strip comments)
+                prep_args = (args.skeleton, skel_stripped_dir, skel_comments_dir)
+                stem_id, prep_status = _preprocess_single_submission_worker(prep_args)
+                
+                if prep_status == "OK":
+                    # Resolve stripped source path
+                    stripped_skel_path = os.path.join(skel_stripped_dir, base_name)
+                    if os.path.isdir(args.skeleton):
+                        stripped_skel_path = os.path.join(skel_stripped_dir, stem_id)
+                        
+                    # Step B: Compile using Joern
+                    parse_args = (
+                        stripped_skel_path, 
+                        workspace_dir, 
+                        j_parser.parse_bin, 
+                        j_parser.export_bin
+                    )
+                    skel_id, parse_status = _parse_single_submission(parse_args)
+                    
+                    if parse_status in ("SUCCESS", "CACHED"):
+                        skeleton_graphml_path = os.path.join(workspace_dir, f"{skel_id}.graphml")
+                        logging.info(f"[MASKING] Successfully compiled skeleton to: {skeleton_graphml_path}")
+                    else:
+                        logging.error(f"[MASKING] Joern failed to compile skeleton: {parse_status}")
+                        skeleton_graphml_path = None
+                else:
+                    logging.error(f"[MASKING] Preprocessor failed to strip skeleton comments: {prep_status}")
+                    skeleton_graphml_path = None
+
+    # Initialize loader with resolved .graphml file path
     loader = CPGDataLoader(
         input_dir=workspace_dir,
-        skeleton_path=args.skeleton,
+        skeleton_path=skeleton_graphml_path,
     )
     loader.discover_vocabularies()
     cohort_graphs = loader.load_cohort(
