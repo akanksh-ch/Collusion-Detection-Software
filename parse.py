@@ -162,60 +162,57 @@ class JoernAutomationParser:
     def get_comments_path(workspace_dir, student_id):
         return os.path.join(workspace_dir, "_comments", f"{student_id}_comments.txt")
 
-    def _discover_submission_paths(self, source_dir: str) -> list[tuple[str, str]]:
-        """Recursively parses directories to capture relative structural group paths."""
-        CODE_EXTENSIONS = ('.java', '.c', '.cpp', '.py', '.h')
+    def _discover_submission_paths(self, source_dirs: list[str]) -> list[tuple[str, str]]:
+        """
+        Natively handles multiple root directories exactly like JPlag.
+        Appends the parent directory prefix if multiple roots are declared.
+        """
+        if isinstance(source_dirs, str):
+            source_dirs = [source_dirs]
+
         submission_targets = []
-        base_abs = os.path.abspath(source_dir)
-        queue = [base_abs]
         
-        while queue:
-            current_dir = queue.pop(0)
+        for src_dir in source_dirs:
+            base_abs = os.path.abspath(src_dir)
+            if not os.path.exists(base_abs):
+                continue
+                
+            root_base = os.path.basename(src_dir.rstrip("/\\"))
+            
             try:
-                items = os.listdir(current_dir)
+                items = os.listdir(base_abs)
             except OSError:
                 continue
                 
-            has_code_files = False
-            sub_dirs = []
-            
             for item in items:
                 if item.startswith('.'):
                     continue
-                full_path = os.path.join(current_dir, item)
-                
+                full_path = os.path.join(base_abs, item)
                 if os.path.isdir(full_path):
-                    sub_dirs.append(full_path)
-                elif os.path.isfile(full_path):
-                    ext = os.path.splitext(item.lower())[1]
-                    if ext in CODE_EXTENSIONS:
-                        has_code_files = True
-                        
-            if has_code_files or not sub_dirs:
-                if current_dir != base_abs or has_code_files:
-                    rel_path = os.path.relpath(current_dir, base_abs)
-                    rel_id = rel_path.replace(os.sep, "/")
-                    submission_targets.append((current_dir, rel_id))
-            else:
-                queue.extend(sub_dirs)
-                
+                    # Match JPlag: Prefix identity labels if comparing across multiple source roots
+                    if len(source_dirs) > 1:
+                        rel_id = f"{root_base}/{item}"
+                    else:
+                        rel_id = item
+                    submission_targets.append((full_path, rel_id))
+                    
         return submission_targets
 
-    def preprocess_submissions(self, source_dir, workspace_dir):
-        """Strip comments from deep true submission directories."""
+    def preprocess_submissions(self, source_dirs, workspace_dir):
+        """Strip comments from deep true submission directories across all root locations."""
         stripped_dir = self.stripped_source_dir(workspace_dir)
         comments_dir = self.comments_dir(workspace_dir)
         os.makedirs(stripped_dir, exist_ok=True)
         os.makedirs(comments_dir, exist_ok=True)
 
-        discovered_targets = self._discover_submission_paths(source_dir)
+        discovered_targets = self._discover_submission_paths(source_dirs)
 
         tasks = []
         for abs_path, rel_id in discovered_targets:
             tasks.append((abs_path, stripped_dir, comments_dir, rel_id))
 
         if not tasks:
-            logging.warning("[PREPROCESS] No source files found for comment stripping.")
+            logging.warning("[PREPROCESS] No valid source targets discovered across specified roots.")
             return False
 
         max_workers = max(1, os.cpu_count() - 1)
@@ -232,25 +229,23 @@ class JoernAutomationParser:
         logging.info(f"[PREPROCESS] Stripped comments from {ok}/{len(tasks)} targets.")
         return ok > 0
 
-    def process_submission_folder(self, source_dir, output_dir):
-        """Processes structures inside the comment-stripped staging folder location."""
+    def process_submission_folder(self, source_dirs, output_dir):
+        """Compiles comment-stripped submissions structured under the workspace layout."""
         os.makedirs(output_dir, exist_ok=True)
-        if not os.path.exists(source_dir):
-            logging.error(f"Source directory '{source_dir}' does not exist.")
-            return False
+        stripped_dir = self.stripped_source_dir(output_dir)
 
-        discovered_targets = self._discover_submission_paths(source_dir)
+        discovered_targets = self._discover_submission_paths(source_dirs)
 
         if not discovered_targets:
-            logging.warning(f"No valid source submissions discovered inside {source_dir}.")
+            logging.warning(f"No valid source submissions found.")
             return False
 
         logging.info(f"[PARALLEL ORCHESTRATION] Submitting {len(discovered_targets)} targets to CPU Process Pool...")
 
         max_workers = max(1, os.cpu_count() - 1)
         worker_tasks = [
-            (abs_path, output_dir, self.parse_bin, self.export_bin, rel_id)
-            for abs_path, rel_id in discovered_targets
+            (os.path.join(stripped_dir, rel_id), output_dir, self.parse_bin, self.export_bin, rel_id)
+            for _, rel_id in discovered_targets
         ]
 
         success_count = 0

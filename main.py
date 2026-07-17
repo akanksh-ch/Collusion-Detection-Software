@@ -7,7 +7,7 @@ Wires up all four backend modules with correct data handoff:
   4. analyser.py — HNSW search, disaggregation, GST, Leiden
 
 CLI flags:
-  --src             Raw submission directory
+  --src             Raw submission directory (supports multiple inputs)
   --out             Output path for the compressed forensic archive
   --skeleton        Optional instructor boilerplate GraphML for masking
   --skip-parse      Skip Joern compilation, use existing GraphML
@@ -53,9 +53,10 @@ def main():
     )
 
     # ── Core parameters (JPlag-compatible names) ─────────────────────
+    # Fixed: Swapped to action="append" to process multiple separate source targets flawlessly
     parser.add_argument(
-        "--src", type=str, default="./submissions",
-        help="Root directory with submissions to check for plagiarism.",
+        "--src", type=str, action="append", default=None,
+        help="Root directory with submissions to check for plagiarism. Can be specified multiple times.",
     )
     parser.add_argument(
         "-r", "--result-file", type=str, default="result.jplag",
@@ -158,6 +159,10 @@ def main():
 
     args = parser.parse_args()
 
+    # Fallback to defaults if no custom paths are appended
+    if not args.src:
+        args.src = ["./submissions"]
+
     # Ensure .jplag extension
     if not args.out.endswith(".jplag"):
         args.out += ".jplag"
@@ -169,7 +174,7 @@ def main():
 
     # Handle --subdirectory
     if args.subdirectory:
-        args.src = os.path.join(args.src, "*", args.subdirectory)
+        args.src = [os.path.join(path, "*", args.subdirectory) for path in args.src]
 
     # Environment variable override for sim floor
     env_floor = os.environ.get("GLOBAL_SIM_FLOOR")
@@ -201,9 +206,8 @@ def main():
         j_parser.preprocess_submissions(args.src, workspace_dir)
 
         logging.info("Step 1b: Parsing stripped source into GraphML via Joern...")
-        stripped_dir = JoernAutomationParser.stripped_source_dir(workspace_dir)
         parse_success = j_parser.process_submission_folder(
-            source_dir=stripped_dir, output_dir=workspace_dir
+            source_dirs=args.src, output_dir=workspace_dir
         )
     else:
         logging.info("Step 1: Skipping parse — using existing GraphML cache.")
@@ -226,7 +230,7 @@ def main():
             # Extract stem to look for pre-existing compiled files in workspace
             base_name = os.path.basename(args.skeleton.rstrip("/\\"))
             stem, _ = os.path.splitext(base_name)
-            candidate_graphml = os.path.join(workspace_dir, f"{stem}.graphml")
+            candidate_graphml = os.path.join(workspace_dir, f"skeleton/{stem}.graphml")
             
             if os.path.exists(candidate_graphml):
                 logging.info(f"[MASKING] Found pre-compiled GraphML for skeleton: {candidate_graphml}")
@@ -244,26 +248,27 @@ def main():
                 from parse import _preprocess_single_submission_worker, _parse_single_submission
                 
                 # Step A: Preprocess (strip comments)
-                prep_args = (args.skeleton, skel_stripped_dir, skel_comments_dir)
+                prep_args = (args.skeleton, skel_stripped_dir, skel_comments_dir, "skeleton")
                 stem_id, prep_status = _preprocess_single_submission_worker(prep_args)
                 
                 if prep_status == "OK":
                     # Resolve stripped source path
-                    stripped_skel_path = os.path.join(skel_stripped_dir, base_name)
-                    if os.path.isdir(args.skeleton):
-                        stripped_skel_path = os.path.join(skel_stripped_dir, stem_id)
+                    stripped_skel_path = os.path.join(skel_stripped_dir, "skeleton")
+                    if os.path.isfile(args.skeleton):
+                        stripped_skel_path = os.path.join(skel_stripped_dir, "skeleton" + os.path.splitext(args.skeleton)[1])
                         
                     # Step B: Compile using Joern
                     parse_args = (
                         stripped_skel_path, 
-                        workspace_dir, 
+                        os.path.join(workspace_dir, "skeleton"), 
                         j_parser.parse_bin, 
-                        j_parser.export_bin
+                        j_parser.export_bin,
+                        "skeleton"
                     )
                     skel_id, parse_status = _parse_single_submission(parse_args)
                     
                     if parse_status in ("SUCCESS", "CACHED"):
-                        skeleton_graphml_path = os.path.join(workspace_dir, f"{skel_id}.graphml")
+                        skeleton_graphml_path = os.path.join(workspace_dir, f"skeleton/{skel_id}.graphml")
                         logging.info(f"[MASKING] Successfully compiled skeleton to: {skeleton_graphml_path}")
                     else:
                         logging.error(f"[MASKING] Joern failed to compile skeleton: {parse_status}")
@@ -291,7 +296,7 @@ def main():
         cohort_data=cohort_graphs,
         node_vocab_size=len(loader.node_vocab),
         edge_vocab_size=len(loader.edge_vocab),
-        source_dir=args.src,
+        source_dir=args.src[0] if args.src else "./submissions", # Reference root directory pointer
         workspace_dir=workspace_dir,
     )
     analyzer.generate_all_embeddings()
