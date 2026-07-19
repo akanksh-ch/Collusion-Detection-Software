@@ -160,10 +160,10 @@ class JPlagReportGenerator:
                     matches.append({
                         "firstFileName": f"{u}/{tile['a_file']}",
                         "secondFileName": f"{v}/{tile['b_file']}",
-                        "startInFirst": {"line": tile["a_lines"][0], "column": 0, "tokenListIndex": start_u},
-                        "endInFirst": {"line": tile["a_lines"][1], "column": 0, "tokenListIndex": end_u},
-                        "startInSecond": {"line": tile["b_lines"][0], "column": 0, "tokenListIndex": start_v},
-                        "endInSecond": {"line": tile["b_lines"][1], "column": 0, "tokenListIndex": end_v},
+                        "startInFirst": {"line": tile["a_lines"][0], "column": tile.get("a_col_start", 0), "tokenListIndex": start_u},
+                        "endInFirst": {"line": tile["a_lines"][1], "column": tile.get("a_col_end", 0), "tokenListIndex": end_u},
+                        "startInSecond": {"line": tile["b_lines"][0], "column": tile.get("b_col_start", 0), "tokenListIndex": start_v},
+                        "endInSecond": {"line": tile["b_lines"][1], "column": tile.get("b_col_end", 0), "tokenListIndex": end_v},
                         "lengthOfFirst": tl,
                         "lengthOfSecond": tl,
                         "tokens": tl

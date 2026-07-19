@@ -11,9 +11,9 @@ for i in {1..10}; do
     
     # Run the exact working command structure dynamically for o1 through o10
     ~/Downloads/jdk-25/bin/java -jar ~/Downloads/jplag-6.3.0-jar-with-dependencies.jar \
-        -bc "submissions/o${i}/o${i}-orig/" \
         -r "output/result-jplag-o${i}.jplag" \
-        "submissions/o${i}/" \
+        "submissions/orig/o${i}-*" \
+        "submissions/plag/o${i}-*" \
         --mode RUN
         
     echo -e "Finished o${i}\n"

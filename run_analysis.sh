@@ -13,7 +13,6 @@ fi
 mkdir -p output
 
 # 2. Dynamically extract all unique assignment prefixes (e.g., o1, o2, o10)
-# It scans submissions/orig/, grabs everything before the first dash, and keeps unique IDs.
 assignments=$(find submissions/orig -maxdepth 1 -mindepth 1 -type d -exec basename {} \; | cut -d'-' -f1 | sort -u)
 
 if [ -z "$assignments" ]; then
@@ -26,37 +25,35 @@ for assignment in $assignments; do
     echo "Processing Assignment Group: $assignment"
     echo "=================================================="
 
-    # 3. Create an isolated temporary staging directory for this specific assignment run
-    STAGE_DIR="output/stage_${assignment}"
-    mkdir -p "$STAGE_DIR/orig" "$STAGE_DIR/plag"
-
-    # Use symbolic links to instantly stage matching folders into the runner sandbox
-    # This keeps 'orig/' and 'plag/' as the immediate parent folders for relative identity tracking
-    cp -as "$(pwd)/submissions/orig/${assignment}-"* "$STAGE_DIR/orig/" 2>/dev/null
-    cp -as "$(pwd)/submissions/plag/${assignment}-"* "$STAGE_DIR/plag/" 2>/dev/null
-
-    # 4. Dynamically locate the exact base-code folder inside the staged orig directory
-    base_code_dir=$(find "$STAGE_DIR/orig" -maxdepth 1 -mindepth 1 -type d | head -n 1)
+    # 3. Dynamically locate the correct original base-code folder for THIS specific assignment iteration
+    base_code_dir=$(find submissions/orig -maxdepth 1 -mindepth 1 -type d -name "${assignment}-*" | head -n 1)
 
     if [ -z "$base_code_dir" ]; then
         echo "Warning: No original base-code folder found for $assignment. Skipping run."
-        rm -rf "$STAGE_DIR"
         continue
     fi
 
-    # 5. Run the multi-modal detection tool on the isolated environment
+    echo "Using Base Code: $base_code_dir"
+
+    # 4. Build the multi-src argument array dynamically using shell expansion
+    # This targets only directories belonging to the current assignment (e.g., o1-*)
+    src_args=()
+    for dir in submissions/orig/${assignment}-*/ submissions/plag/${assignment}-*/; do
+        if [ -d "$dir" ]; then
+            src_args+=("--src=$dir")
+        fi
+    done
+
+    # 5. Run the multi-modal detection tool directly on the original folder structure
     python main.py \
-        --src="$STAGE_DIR" \
+        "${src_args[@]}" \
         -r="output/result-${assignment}.jplag" \
         --sim-floor 0.8 \
         -t 9 \
         --overwrite \
         --base-code="$base_code_dir"
 
-    echo -e "Finished processing $assignment. Cleaning up temporary stage...\n"
-    
-    # Clean up the symbolic link stage to keep your workspace pristine
-    rm -rf "$STAGE_DIR"
+    echo -e "Finished processing $assignment\n"
 done
 
 echo "All JPlag pipeline runs completed successfully!"

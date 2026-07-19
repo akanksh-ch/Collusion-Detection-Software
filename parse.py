@@ -19,9 +19,7 @@ _COMMENT_PATTERN = re.compile(
 
 
 def _strip_comments(source_text):
-    """Return (stripped_code, extracted_comments) from raw source text."""
     comments = []
-
     def _replacer(m):
         if m.group("string"):
             return m.group("string")
@@ -36,29 +34,30 @@ def _strip_comments(source_text):
 
 def _preprocess_single_submission_worker(args):
     """Strip comments from a single submission and write structured sidecar outputs."""
-    src_path, stripped_dir, comments_dir, rel_id = args
+    src_path, stripped_dir, comments_dir, stem = args
     
-    stem = rel_id
-    target_code_path = os.path.join(stripped_dir, rel_id)
     IGNORED_EXTENSIONS = ('.md', '.txt', '.json', '.yml', '.yaml', '.xml', '.html', '.gitignore')
     all_comments = []
 
     try:
         if os.path.isfile(src_path):
-            os.makedirs(os.path.dirname(target_code_path), exist_ok=True)
+            stripped_path = os.path.join(stripped_dir, stem)
+            os.makedirs(os.path.dirname(stripped_path), exist_ok=True)
             with open(src_path, "r", encoding="utf-8", errors="replace") as f:
                 raw = f.read()
 
             stripped_code, comment_stream = _strip_comments(raw)
-            with open(target_code_path, "w", encoding="utf-8") as f:
+            with open(stripped_path, "w", encoding="utf-8") as f:
                 f.write(stripped_code)
             all_comments.append(comment_stream)
             
         elif os.path.isdir(src_path):
-            os.makedirs(target_code_path, exist_ok=True)
+            target_dir = os.path.join(stripped_dir, stem)
+            os.makedirs(target_dir, exist_ok=True)
+            
             for root, dirs, files in os.walk(src_path):
-                rel_sub = os.path.relpath(root, src_path)
-                curr_target_dir = os.path.join(target_code_path, rel_sub) if rel_sub != '.' else target_code_path
+                rel_path = os.path.relpath(root, src_path)
+                curr_target_dir = os.path.join(target_dir, rel_path) if rel_path != '.' else target_dir
                 os.makedirs(curr_target_dir, exist_ok=True)
 
                 for f_name in files:
@@ -75,7 +74,7 @@ def _preprocess_single_submission_worker(args):
                     with open(os.path.join(curr_target_dir, f_name), "w", encoding="utf-8") as f:
                         f.write(stripped_code)
 
-        comments_path = os.path.join(comments_dir, f"{rel_id}_comments.txt")
+        comments_path = os.path.join(comments_dir, f"{stem}_comments.txt")
         os.makedirs(os.path.dirname(comments_path), exist_ok=True)
         with open(comments_path, "w", encoding="utf-8") as f:
             f.write("\n".join(all_comments))
@@ -87,13 +86,15 @@ def _preprocess_single_submission_worker(args):
 
 def _parse_single_submission(args):
     """Isolated worker function executed inside an independent process core."""
-    path, output_dir, parse_bin, export_bin, rel_id = args
+    path, output_dir, parse_bin, export_bin = args
 
-    student_id = rel_id
-    safe_id = rel_id.replace('/', '_').replace('\\', '_')
-    
-    cpg_bin_path = os.path.join(output_dir, f"{safe_id}_cpg.bin")
-    temp_stage_dir = os.path.join(output_dir, f"{safe_id}_tmp_stage")
+    base_file_name = os.path.basename(path)
+    student_id, _ = os.path.splitext(base_file_name)
+    if os.path.isdir(path):
+        student_id = base_file_name
+
+    cpg_bin_path = os.path.join(output_dir, f"{student_id}_cpg.bin")
+    temp_stage_dir = os.path.join(output_dir, f"{student_id}_tmp_stage")
     final_graphml_path = os.path.join(output_dir, f"{student_id}.graphml")
 
     if os.path.exists(final_graphml_path):
@@ -162,57 +163,44 @@ class JoernAutomationParser:
     def get_comments_path(workspace_dir, student_id):
         return os.path.join(workspace_dir, "_comments", f"{student_id}_comments.txt")
 
-    def _discover_submission_paths(self, source_dirs: list[str]) -> list[tuple[str, str]]:
-        """
-        Natively handles multiple root directories exactly like JPlag.
-        Appends the parent directory prefix if multiple roots are declared.
-        """
+    def preprocess_submissions(self, source_dirs, workspace_dir):
         if isinstance(source_dirs, str):
             source_dirs = [source_dirs]
 
-        submission_targets = []
-        
-        for src_dir in source_dirs:
-            base_abs = os.path.abspath(src_dir)
-            if not os.path.exists(base_abs):
-                continue
-                
-            root_base = os.path.basename(src_dir.rstrip("/\\"))
-            
-            try:
-                items = os.listdir(base_abs)
-            except OSError:
-                continue
-                
-            for item in items:
-                if item.startswith('.'):
-                    continue
-                full_path = os.path.join(base_abs, item)
-                if os.path.isdir(full_path):
-                    # Match JPlag: Prefix identity labels if comparing across multiple source roots
-                    if len(source_dirs) > 1:
-                        rel_id = f"{root_base}/{item}"
-                    else:
-                        rel_id = item
-                    submission_targets.append((full_path, rel_id))
-                    
-        return submission_targets
-
-    def preprocess_submissions(self, source_dirs, workspace_dir):
-        """Strip comments from deep true submission directories across all root locations."""
         stripped_dir = self.stripped_source_dir(workspace_dir)
         comments_dir = self.comments_dir(workspace_dir)
         os.makedirs(stripped_dir, exist_ok=True)
         os.makedirs(comments_dir, exist_ok=True)
 
-        discovered_targets = self._discover_submission_paths(source_dirs)
-
+        IGNORED_EXTENSIONS = ('.md', '.txt', '.json', '.yml', '.yaml', '.xml', '.html', '.gitignore')
         tasks = []
-        for abs_path, rel_id in discovered_targets:
-            tasks.append((abs_path, stripped_dir, comments_dir, rel_id))
+        
+        # Loop through all provided root directories
+        for src_dir in source_dirs:
+            if not os.path.exists(src_dir):
+                logging.warning(f"[PREPROCESS] Source directory '{src_dir}' does not exist.")
+                continue
+                
+            root_name = os.path.basename(os.path.normpath(src_dir))
+            
+            # Every immediate child is treated as a submission exactly like the original code
+            for item in os.listdir(src_dir):
+                if item.startswith('.'):
+                    continue
+                    
+                full = os.path.join(src_dir, item)
+                
+                if os.path.isdir(full) or (os.path.isfile(full) and not item.lower().endswith(IGNORED_EXTENSIONS)):
+                    # Mimic JPlag: Prefix with root folder name if comparing multiple roots (e.g. orig_o1-wqfqn)
+                    if len(source_dirs) > 1:
+                        stem = f"{root_name}_{item}"
+                    else:
+                        stem = item
+                        
+                    tasks.append((full, stripped_dir, comments_dir, stem))
 
         if not tasks:
-            logging.warning("[PREPROCESS] No valid source targets discovered across specified roots.")
+            logging.warning("[PREPROCESS] No valid submissions found to strip.")
             return False
 
         max_workers = max(1, os.cpu_count() - 1)
@@ -229,23 +217,36 @@ class JoernAutomationParser:
         logging.info(f"[PREPROCESS] Stripped comments from {ok}/{len(tasks)} targets.")
         return ok > 0
 
-    def process_submission_folder(self, source_dirs, output_dir):
-        """Compiles comment-stripped submissions structured under the workspace layout."""
+    def process_submission_folder(self, source_dir, output_dir):
+        """Processes structures from the comment-stripped staging folder."""
         os.makedirs(output_dir, exist_ok=True)
-        stripped_dir = self.stripped_source_dir(output_dir)
-
-        discovered_targets = self._discover_submission_paths(source_dirs)
-
-        if not discovered_targets:
-            logging.warning(f"No valid source submissions found.")
+        if not os.path.exists(source_dir):
+            logging.error(f"Source directory '{source_dir}' does not exist.")
             return False
 
-        logging.info(f"[PARALLEL ORCHESTRATION] Submitting {len(discovered_targets)} targets to CPU Process Pool...")
+        # Read directly from the flattened _stripped directory
+        items = [os.path.join(source_dir, x) for x in os.listdir(source_dir)]
+
+        IGNORED_EXTENSIONS = ('.md', '.txt', '.json', '.yml', '.yaml', '.xml', '.html', '.gitignore')
+        submissions = []
+        for x in items:
+            base = os.path.basename(x)
+            if base.startswith('.'):
+                continue
+            if os.path.isfile(x) and base.lower().endswith(IGNORED_EXTENSIONS):
+                continue
+            submissions.append(x)
+
+        if not submissions:
+            logging.warning(f"No valid source submissions discovered inside {source_dir}.")
+            return False
+
+        logging.info(f"[PARALLEL ORCHESTRATION] Submitting {len(submissions)} targets to CPU Process Pool...")
 
         max_workers = max(1, os.cpu_count() - 1)
         worker_tasks = [
-            (os.path.join(stripped_dir, rel_id), output_dir, self.parse_bin, self.export_bin, rel_id)
-            for _, rel_id in discovered_targets
+            (path, output_dir, self.parse_bin, self.export_bin)
+            for path in submissions
         ]
 
         success_count = 0

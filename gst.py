@@ -281,6 +281,8 @@ def tiles_to_json(tiles: List[Tile]) -> list[dict]:
     """Serialise tiles into a JSON-friendly list for the report payload."""
     out = []
     for t in tiles:
+        first_a, last_a = t.tokens_a[0], t.tokens_a[-1]
+        first_b, last_b = t.tokens_b[0], t.tokens_b[-1]
         out.append({
             "length": t.length,
             "a_lines": list(t.a_lines),
@@ -289,6 +291,13 @@ def tiles_to_json(tiles: List[Tile]) -> list[dict]:
             "b_file": t.b_file,
             "a_token_idx": t.a_token_idx,
             "b_token_idx": t.b_token_idx,
+            # Precise column bounds of the *first* and *last* matched token
+            # on each side, so highlighting can wrap the exact matched span
+            # instead of defaulting to whole lines.
+            "a_col_start": first_a.col,
+            "a_col_end": last_a.col + len(last_a.raw),
+            "b_col_start": first_b.col,
+            "b_col_end": last_b.col + len(last_b.raw),
             "matched_text_a": " ".join(tok.raw for tok in t.tokens_a),
             "matched_text_b": " ".join(tok.raw for tok in t.tokens_b),
         })

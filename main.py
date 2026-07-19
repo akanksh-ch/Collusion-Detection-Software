@@ -5,19 +5,6 @@ Wires up all four backend modules with correct data handoff:
   2. loader.py   — template masking, slicing, casing, tensorisation
   3. gnn.py      — dual-track encoding + Gated Multimodal Fusion
   4. analyser.py — HNSW search, disaggregation, GST, Leiden
-
-CLI flags:
-  --src             Raw submission directory (supports multiple inputs)
-  --out             Output path for the compressed forensic archive
-  --skeleton        Optional instructor boilerplate GraphML for masking
-  --skip-parse      Skip Joern compilation, use existing GraphML
-  --no-slice        Disable backward dependency slicing
-  --sim-floor       Global cosine similarity floor (default 0.85)
-  --leiden-res      Leiden resolution parameter (default 1.4)
-  --gst-min-tile    GST minimum match length in tokens (default 8)
-
-Environment variable override:
-  GLOBAL_SIM_FLOOR  Overrides --sim-floor if set
 """
 
 import logging
@@ -39,7 +26,6 @@ logging.basicConfig(
 
 
 def main():
-    # Enforce safe multiprocessing start methods across varying OS environments
     try:
         multiprocessing.set_start_method("spawn")
     except RuntimeError:
@@ -53,10 +39,10 @@ def main():
     )
 
     # ── Core parameters (JPlag-compatible names) ─────────────────────
-    # Fixed: Swapped to action="append" to process multiple separate source targets flawlessly
+    # Changed to action="append" to support multiple roots natively
     parser.add_argument(
         "--src", type=str, action="append", default=None,
-        help="Root directory with submissions to check for plagiarism. Can be specified multiple times.",
+        help="Root directory with submissions to check for plagiarism. Specify multiple times for multiple roots.",
     )
     parser.add_argument(
         "-r", "--result-file", type=str, default="result.jplag",
@@ -71,26 +57,22 @@ def main():
     )
     parser.add_argument(
         "-l", "--language", type=str, default="java",
-        help="Select the language of the submissions (default: java). "
-             "Currently supported: java, c, cpp, python.",
+        help="Select the language of the submissions (default: java).",
     )
     parser.add_argument(
         "-m", "--similarity-threshold", type=float, default=0.0,
         dest="sim_threshold",
-        help="Comparison similarity threshold [0.0-1.0]: All comparisons above "
-             "this threshold will be saved (default: 0.0).",
+        help="Comparison similarity threshold [0.0-1.0].",
     )
     parser.add_argument(
         "-t", "--min-tokens", type=int, default=9,
         dest="gst_min_tile",
-        help="Tunes the comparison sensitivity by adjusting the minimum token "
-             "required to be counted as a matching section (default: 9).",
+        help="Tunes the comparison sensitivity.",
     )
     parser.add_argument(
         "-n", "--shown-comparisons", type=int, default=2500,
         dest="shown_comparisons",
-        help="The maximum number of comparisons that will be shown in the "
-             "generated report, if set to -1 all comparisons will be shown (default: 2500).",
+        help="The maximum number of comparisons shown in report.",
     )
     parser.add_argument(
         "-s", "--subdirectory", type=str, default=None,
@@ -99,63 +81,17 @@ def main():
     )
 
     # ── Advanced ─────────────────────────────────────────────────────
-    parser.add_argument(
-        "--csv-export", action="store_true",
-        help="Export pairwise similarity values as a CSV file.",
-    )
-    parser.add_argument(
-        "--overwrite", action="store_true",
-        help="Existing result files will be overwritten.",
-    )
-    parser.add_argument(
-        "--skip-parse", action="store_true",
-        help="Skip Joern compilation and use existing GraphML exports.",
-    )
-    parser.add_argument(
-        "--no-slice", action="store_true",
-        help="Disable backward dependency slicing.",
-    )
-
-    # ── Pipeline-specific parameters ─────────────────────────────────
-    parser.add_argument(
-        "--sim-floor", type=float, default=0.85,
-        help="AI cosine similarity floor for HNSW candidate filtering (default: 0.85). "
-             "Pairs below this threshold are not analysed by GST. "
-             "Note: isotropic calibration (All-But-The-Top) stabilises the vector "
-             "space; this cutoff was derived empirically via precision-recall tuning "
-             "against the labelled ground-truth corpus.",
-    )
-    parser.add_argument(
-        "--leiden-res", type=float, default=1.4,
-        help="Leiden resolution parameter (default: 1.4).",
-    )
-
-    # ── Subsequence Match Merging ────────────────────────────────────
-    parser.add_argument(
-        "--match-merging", action="store_true", default=True,
-        help="Enables merging of neighboring matches to counteract obfuscation "
-             "attempts (default: enabled).",
-    )
-    parser.add_argument(
-        "--no-match-merging", action="store_false", dest="match_merging",
-        help="Disables merging of neighboring matches.",
-    )
-    parser.add_argument(
-        "--gap-size", type=int, default=6,
-        help="Maximal gap between neighboring matches to be merged "
-             "(between 1 and minTokenMatch, default: 6).",
-    )
-    parser.add_argument(
-        "--neighbor-length", type=int, default=2,
-        help="Minimal length of neighboring matches to be merged "
-             "(between 1 and minTokenMatch, default: 2).",
-    )
-
-    # ── Clustering ───────────────────────────────────────────────────
-    parser.add_argument(
-        "--cluster-skip", action="store_true",
-        help="Skips the Leiden cluster calculation.",
-    )
+    parser.add_argument("--csv-export", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--skip-parse", action="store_true")
+    parser.add_argument("--no-slice", action="store_true")
+    parser.add_argument("--sim-floor", type=float, default=0.85)
+    parser.add_argument("--leiden-res", type=float, default=1.4)
+    parser.add_argument("--match-merging", action="store_true", default=True)
+    parser.add_argument("--no-match-merging", action="store_false", dest="match_merging")
+    parser.add_argument("--gap-size", type=int, default=6)
+    parser.add_argument("--neighbor-length", type=int, default=2)
+    parser.add_argument("--cluster-skip", action="store_true")
 
     args = parser.parse_args()
 
@@ -163,20 +99,16 @@ def main():
     if not args.src:
         args.src = ["./submissions"]
 
-    # Ensure .jplag extension
     if not args.out.endswith(".jplag"):
         args.out += ".jplag"
 
-    # Handle --overwrite
     if os.path.exists(args.out) and not args.overwrite:
         if os.path.isfile(args.out):
-            pass  # Will be overwritten by zipfile anyway
+            pass 
 
-    # Handle --subdirectory
     if args.subdirectory:
         args.src = [os.path.join(path, "*", args.subdirectory) for path in args.src]
 
-    # Environment variable override for sim floor
     env_floor = os.environ.get("GLOBAL_SIM_FLOOR")
     if env_floor is not None:
         try:
@@ -206,12 +138,12 @@ def main():
         j_parser.preprocess_submissions(args.src, workspace_dir)
 
         logging.info("Step 1b: Parsing stripped source into GraphML via Joern...")
+        stripped_dir = JoernAutomationParser.stripped_source_dir(workspace_dir)
         parse_success = j_parser.process_submission_folder(
-            source_dirs=args.src, output_dir=workspace_dir
+            source_dir=stripped_dir, output_dir=workspace_dir
         )
     else:
         logging.info("Step 1: Skipping parse — using existing GraphML cache.")
-        # Still run comment stripping if sidecar files don't exist yet
         comments_dir = JoernAutomationParser.comments_dir(workspace_dir)
         if not os.path.isdir(comments_dir) or not os.listdir(comments_dir):
             logging.info("Step 1a: Generating comment sidecar files...")
@@ -221,54 +153,44 @@ def main():
     # ── Step 2: Vocabulary discovery + graph loading ──────────────────
     logging.info("Step 2: Loading and processing code property graphs...")
 
-    # ── Automatic Skeleton Compilation on the Fly ─────────────────────
     skeleton_graphml_path = args.skeleton
     if args.skeleton:
         if args.skeleton.endswith(".graphml"):
             skeleton_graphml_path = args.skeleton
         else:
-            # Extract stem to look for pre-existing compiled files in workspace
             base_name = os.path.basename(args.skeleton.rstrip("/\\"))
             stem, _ = os.path.splitext(base_name)
-            candidate_graphml = os.path.join(workspace_dir, f"skeleton/{stem}.graphml")
+            candidate_graphml = os.path.join(workspace_dir, f"{stem}.graphml")
             
             if os.path.exists(candidate_graphml):
                 logging.info(f"[MASKING] Found pre-compiled GraphML for skeleton: {candidate_graphml}")
                 skeleton_graphml_path = candidate_graphml
             else:
                 logging.info(f"[MASKING] Raw skeleton detected: '{args.skeleton}'. Compiling on the fly...")
-                
-                # Setup skeleton-specific stage folders
                 skel_stripped_dir = os.path.join(workspace_dir, "_stripped_skeleton")
                 skel_comments_dir = os.path.join(workspace_dir, "_comments_skeleton")
                 os.makedirs(skel_stripped_dir, exist_ok=True)
                 os.makedirs(skel_comments_dir, exist_ok=True)
                 
-                # Synchronously run workers since we only need to parse one skeleton
                 from parse import _preprocess_single_submission_worker, _parse_single_submission
                 
-                # Step A: Preprocess (strip comments)
+                # Added the 4th argument stem string 'skeleton'
                 prep_args = (args.skeleton, skel_stripped_dir, skel_comments_dir, "skeleton")
                 stem_id, prep_status = _preprocess_single_submission_worker(prep_args)
                 
                 if prep_status == "OK":
-                    # Resolve stripped source path
                     stripped_skel_path = os.path.join(skel_stripped_dir, "skeleton")
-                    if os.path.isfile(args.skeleton):
-                        stripped_skel_path = os.path.join(skel_stripped_dir, "skeleton" + os.path.splitext(args.skeleton)[1])
-                        
-                    # Step B: Compile using Joern
+                    
                     parse_args = (
                         stripped_skel_path, 
-                        os.path.join(workspace_dir, "skeleton"), 
+                        workspace_dir, 
                         j_parser.parse_bin, 
-                        j_parser.export_bin,
-                        "skeleton"
+                        j_parser.export_bin
                     )
                     skel_id, parse_status = _parse_single_submission(parse_args)
                     
                     if parse_status in ("SUCCESS", "CACHED"):
-                        skeleton_graphml_path = os.path.join(workspace_dir, f"skeleton/{skel_id}.graphml")
+                        skeleton_graphml_path = os.path.join(workspace_dir, f"{skel_id}.graphml")
                         logging.info(f"[MASKING] Successfully compiled skeleton to: {skeleton_graphml_path}")
                     else:
                         logging.error(f"[MASKING] Joern failed to compile skeleton: {parse_status}")
@@ -277,7 +199,6 @@ def main():
                     logging.error(f"[MASKING] Preprocessor failed to strip skeleton comments: {prep_status}")
                     skeleton_graphml_path = None
 
-    # Initialize loader with resolved .graphml file path
     loader = CPGDataLoader(
         input_dir=workspace_dir,
         skeleton_path=skeleton_graphml_path,
@@ -296,7 +217,7 @@ def main():
         cohort_data=cohort_graphs,
         node_vocab_size=len(loader.node_vocab),
         edge_vocab_size=len(loader.edge_vocab),
-        source_dir=args.src[0] if args.src else "./submissions", # Reference root directory pointer
+        source_dir=args.src, # Pass the entire list of roots directly
         workspace_dir=workspace_dir,
     )
     analyzer.generate_all_embeddings()
@@ -317,11 +238,9 @@ def main():
     logging.info("Step 5: Computing ranked suspicion scores...")
     flagged_pairs = analyzer.compute_suspicion_scores(families)
 
-    # Apply similarity threshold filter (like JPlag -m)
     if args.sim_threshold > 0.0:
         flagged_pairs = [p for p in flagged_pairs if p["similarity"] >= args.sim_threshold]
 
-    # Cap shown comparisons (like JPlag -n)
     if args.shown_comparisons != -1:
         flagged_pairs = flagged_pairs[:args.shown_comparisons]
 
@@ -345,7 +264,6 @@ def main():
         output_path=args.out
     )
 
-    # ── Optional CSV export ──────────────────────────────────────────
     if args.csv_export:
         csv_path = args.out.replace(".jplag", ".csv")
         import csv

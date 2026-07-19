@@ -1,7 +1,7 @@
 """HNSW Indexing, Forensic Disaggregation, GST Evidence, & Leiden Clustering.
 
 Implements Module 4 of the production specification:
-  1. FAISS HNSW all-pairs similarity search on V_program
+  1. FAISS Exact all-pairs similarity search on V_program
   2. Forensic disaggregation: independent cos(V_topo), cos(V_text) per pair
   3. Greedy String Tiling line-level evidence generation
   4. Leiden community detection for collusion-network partitioning
@@ -107,7 +107,7 @@ class CohortAnalyzer:
         )
 
     # ------------------------------------------------------------------
-    # Step 2: HNSW all-pairs search + disaggregation + GST
+    # Step 2: Exact all-pairs search + disaggregation + GST
     # ------------------------------------------------------------------
     def extract_solution_families(
         self,
@@ -120,7 +120,7 @@ class CohortAnalyzer:
         cluster_skip: bool = False,
         **kwargs,
     ):
-        """Build HNSW index, flag candidate pairs, disaggregate scores,
+        """Build Exact index, flag candidate pairs, disaggregate scores,
         generate GST evidence, and cluster via Leiden."""
         import igraph as ig
         import leidenalg as la
@@ -136,15 +136,15 @@ class CohortAnalyzer:
         for sid in self.student_ids:
             self.knn_graph.add_node(sid)
 
-        # ── FAISS HNSW index ─────────────────────────────────────────
+        # ── FAISS Exact Index ─────────────────────────────────────────
         embeddings_f32 = np.ascontiguousarray(self.embeddings)
         dimension = embeddings_f32.shape[1]
 
-        index = faiss.IndexHNSWFlat(dimension, 32)
+        index = faiss.IndexFlatIP(dimension)
         index.add(embeddings_f32)
 
-        # All-pairs: query every vector, retrieve a bounded local neighborhood
-        k_search = min(num_students, 32)
+        # All-pairs: query every vector against the entire cohort
+        k_search = num_students
         _, indices = index.search(embeddings_f32, k_search)
 
         # ── Build similarity edges ───────────────────────────────────
@@ -309,7 +309,9 @@ class CohortAnalyzer:
                 family_label = "Cross_Template_Overlap"
                 family_density = similarity
 
-            if similarity >= 0.99:
+            if family_label == "Cross_Template_Overlap":
+                risk_level = "SUSPICIOUS"
+            elif similarity >= 0.99:
                 risk_level = "CRITICAL"
             elif similarity >= 0.94:
                 risk_level = "HIGH"
@@ -386,15 +388,41 @@ class CohortAnalyzer:
         return self._read_original_source(student_id)
 
     def _read_original_source(self, student_id: str) -> dict[str, str]:
-        orig_dir = os.path.join(self.source_dir, student_id)
-        if os.path.isdir(orig_dir):
-            return self._read_dir_files(orig_dir, orig_dir)
+        source_dirs = self.source_dir if isinstance(self.source_dir, list) else [self.source_dir]
+        
+        for src_dir in source_dirs:
+            # 1. Check direct match (for single root runs)
+            orig_dir = os.path.join(src_dir, student_id)
+            if os.path.isdir(orig_dir):
+                return self._read_dir_files(orig_dir, orig_dir)
+            
+            # 2. Check prefixed match (for multi-root runs e.g. "orig_o1-wqfqn")
+            root_name = os.path.basename(os.path.normpath(src_dir))
+            prefix = f"{root_name}_"
+            
+            if student_id.startswith(prefix):
+                real_id = student_id[len(prefix):]
+                orig_dir_2 = os.path.join(src_dir, real_id)
+                if os.path.isdir(orig_dir_2):
+                    return self._read_dir_files(orig_dir_2, orig_dir_2)
 
-        for ext in (".java", ".c", ".cpp", ".py"):
-            orig = os.path.join(self.source_dir, f"{student_id}{ext}")
-            if os.path.isfile(orig):
-                with open(orig, "r", encoding="utf-8", errors="replace") as f:
-                    return {os.path.basename(orig): f.read()}
+        # 3. Fallback check for single files
+        for src_dir in source_dirs:
+            for ext in (".java", ".c", ".cpp", ".py"):
+                orig = os.path.join(src_dir, f"{student_id}{ext}")
+                if os.path.isfile(orig):
+                    with open(orig, "r", encoding="utf-8", errors="replace") as f:
+                        return {os.path.basename(orig): f.read()}
+                        
+                # Check unpacked file name
+                root_name = os.path.basename(os.path.normpath(src_dir))
+                prefix = f"{root_name}_"
+                if student_id.startswith(prefix):
+                    real_id = student_id[len(prefix):]
+                    orig2 = os.path.join(src_dir, f"{real_id}{ext}")
+                    if os.path.isfile(orig2):
+                        with open(orig2, "r", encoding="utf-8", errors="replace") as f:
+                            return {os.path.basename(orig2): f.read()}
 
         return {}
 
