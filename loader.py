@@ -14,6 +14,13 @@ _PASCAL  = re.compile(r"^[A-Z][a-z0-9]*(?:[A-Z][a-z0-9]*)+$")
 _UPPER   = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$")
 _SINGLE  = re.compile(r"^[a-zA-Z_]$")
 
+# Loop-family control structures that should be treated as one canonical
+# node type (CONTROL_LOOP) rather than distinct FOR/WHILE/DO types.
+# This gives renaming-invariance-style protection against L6 "change loop
+# type" obfuscation attacks (e.g. Karnalim's taxonomy, Nocte's for->while
+# normalization), at the cost of losing the specific loop kind as a feature.
+_LOOP_TYPES = frozenset({"FOR", "WHILE", "DO", "DOWHILE", "DO_WHILE"})
+
 
 def classify_casing(name: str) -> int:
     if not name or _SINGLE.match(name):
@@ -42,6 +49,25 @@ def _node_structural_hash(G, node, label_key):
     )
     sig = f"{node_type}|{'|'.join(neighbour_types)}"
     return hashlib.sha256(sig.encode()).hexdigest()
+
+
+def _resolve_control_label(attrs):
+    """Resolve the vocabulary label for a CONTROL_STRUCTURE node.
+
+    Loop-family constructs (FOR/WHILE/DO) are canonicalized to a single
+    CONTROL_LOOP label so that changing loop type (an L6 obfuscation
+    attack) does not change the node's structural embedding. Other
+    control structures (IF, SWITCH, etc.) keep their specific label.
+    """
+    control_type = str(
+        attrs.get("CONTROL_STRUCTURE_TYPE", attrs.get("controlStructureType", ""))
+    ).upper()
+
+    if control_type in _LOOP_TYPES:
+        return "CONTROL_LOOP"
+    if control_type:
+        return f"CONTROL_{control_type}"
+    return "CONTROL_STRUCTURE"
 
 
 def _load_and_slice_single_file(args):
@@ -114,9 +140,7 @@ def _load_and_slice_single_file(args):
             if label == "CALL" and node_name.startswith("<OPERATOR>."):
                 label = f"CALL_{node_name}"
             elif label == "CONTROL_STRUCTURE":
-                control_type = str(attrs.get("CONTROL_STRUCTURE_TYPE", attrs.get("controlStructureType", ""))).upper()
-                if control_type:
-                    label = f"CONTROL_{control_type}"
+                label = _resolve_control_label(attrs)
 
             x_type = node_vocab.get(label, node_vocab.get("UNKNOWN", 0))
             raw_name = str(attrs.get("NAME", attrs.get("name", "")))
@@ -204,9 +228,7 @@ class CPGDataLoader:
                         if label == "CALL" and node_name.startswith("<OPERATOR>."):
                             label = f"CALL_{node_name}"
                         elif label == "CONTROL_STRUCTURE":
-                            control_type = str(attrs.get("CONTROL_STRUCTURE_TYPE", attrs.get("controlStructureType", ""))).upper()
-                            if control_type:
-                                label = f"CONTROL_{control_type}"
+                            label = _resolve_control_label(attrs)
                         node_labels.add(label)
 
                 for _, _, attrs in G.edges(data=True):
