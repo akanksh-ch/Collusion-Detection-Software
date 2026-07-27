@@ -14,7 +14,7 @@ Implements Module 3 of the production specification:
                        g       = σ(W_g [V̄_topo ∥ V̄_text] + b_g)
                        V_prog  = g ⊙ V̄_topo + (1-g) ⊙ V̄_text
 
-Revision notes:
+Notes:
   - GAT uses residual skip connections to prevent over-smoothing with
     frozen random weights (diagnosed: 3-layer GAT collapsed cosine
     similarities to 0.997–1.000 across all pairs).
@@ -30,8 +30,7 @@ import logging
 import numpy as np
 import torch
 import torch.nn as nn
-from torch_geometric.nn import GATConv
-from torch_geometric.nn.aggr import AttentionalAggregation
+from torch_geometric.nn import GATConv, global_mean_pool
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
 from sklearn.preprocessing import normalize as sklearn_normalize
@@ -90,10 +89,6 @@ class GraphEncoder(nn.Module):
         # Output projection for residual dimension alignment
         self.residual_proj = nn.Linear(hidden_dim, output_dim)
 
-        # Global Attention Pooling (using non-deprecated API)
-        gate_nn = nn.Sequential(nn.Linear(output_dim, 1))
-        self.pool = AttentionalAggregation(gate_nn)
-
     def forward(self, x, edge_index, edge_attr=None, batch=None):
         # x: [N, 2]  →  col 0 = x_type, col 1 = x_style
         x_type = x[:, 0].long()
@@ -122,10 +117,14 @@ class GraphEncoder(nn.Module):
         h_res = self.residual_proj(h)
         h = self.relu(self.ln2(self.conv2(h, edge_index, edge_attr=edge_feat) + h_res))
 
-        # Global attention pooling
+        # Global mean pooling — every node contributes equally, giving a
+        # stable, size-normalised topological hash. (Uses global_mean_pool
+        # rather than an AttentionalAggregation gate_nn, since that gate
+        # is frozen/untrained and therefore assigns arbitrary, size-sensitive
+        # attention weights rather than a meaningful summary of the subgraph.)
         if batch is None:
             batch = torch.zeros(h.size(0), dtype=torch.long, device=h.device)
-        return self.pool(h, batch)  # [1, output_dim]
+        return global_mean_pool(h, batch)  # [1, output_dim]
 
 
 # ══════════════════════════════════════════════════════════════════════
