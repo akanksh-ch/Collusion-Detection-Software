@@ -1,0 +1,12 @@
+numpy
+torch
+pandas>=2.0
+gensim
+karateclub
+networkx
+faiss-cpu
+scikit-learn
+python-igraph
+leidenalg
+typing_extensions
+filelock
