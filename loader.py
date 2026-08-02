@@ -2,9 +2,10 @@ import os
 import re
 import hashlib
 import logging
+from dataclasses import dataclass
+
 import networkx as nx
 import torch
-from torch_geometric.data import Data
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
@@ -20,6 +21,19 @@ _SINGLE  = re.compile(r"^[a-zA-Z_]$")
 # type" obfuscation attacks (e.g. Karnalim's taxonomy, Nocte's for->while
 # normalization), at the cost of losing the specific loop kind as a feature.
 _LOOP_TYPES = frozenset({"FOR", "WHILE", "DO", "DOWHILE", "DO_WHILE"})
+
+
+@dataclass
+class CPGGraph:
+    """Plain container for a parsed CPG — replaces torch_geometric.data.Data.
+
+    graph2vec (karateclub) consumes networkx graphs built from these
+    fields directly; nothing downstream needs PyG's batching/loader
+    machinery, so this drops that dependency entirely.
+    """
+    x: torch.Tensor          # [N, 2] int64 — (node_type_idx, style_idx)
+    edge_index: torch.Tensor  # [2, E] int64
+    edge_attr: torch.Tensor   # [E] int64
 
 
 def classify_casing(name: str) -> int:
@@ -174,7 +188,7 @@ def _load_and_slice_single_file(args):
 
 class CPGDataLoader:
     """Manages multithreaded file loading with deep recursive schema lookups."""
-    
+
     def __init__(self, input_dir, skeleton_path=None):
         self.input_dir = input_dir
         self.skeleton_path = skeleton_path
@@ -192,7 +206,7 @@ class CPGDataLoader:
 
         candidate_keys = ["labelV", "label", "_label", "type", "nodeType"]
         graphml_files = []
-        
+
         for root, _, files in os.walk(self.input_dir):
             if any(x in root for x in ("_stripped", "_comments", "skeleton")):
                 continue
@@ -272,7 +286,7 @@ class CPGDataLoader:
         for f in files:
             rel_path = os.path.relpath(f, base_abs)
             student_id = os.path.splitext(rel_path)[0].replace(os.sep, "/")
-            tasks.append((f, self.node_vocab, self.edge_vocab, bypass_slicing, 
+            tasks.append((f, self.node_vocab, self.edge_vocab, bypass_slicing,
                           self.active_label_key, self._skeleton_hashes, student_id))
 
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -284,8 +298,9 @@ class CPGDataLoader:
                     edge_index = torch.tensor(payload["edge_index"], dtype=torch.long).t().contiguous()
                     edge_attr = torch.tensor(payload["edge_attr"], dtype=torch.long)
 
-                    pyg_data = Data(x=x_tensor, edge_index=edge_index, edge_attr=edge_attr)
-                    cohort_data[student_id] = pyg_data
+                    cohort_data[student_id] = CPGGraph(
+                        x=x_tensor, edge_index=edge_index, edge_attr=edge_attr,
+                    )
 
         return cohort_data
 
@@ -293,7 +308,7 @@ class CPGDataLoader:
     def _generate_dummy_cohort():
         cohort_data = {}
         for i in range(1, 4):
-            mock_data = Data(
+            mock_data = CPGGraph(
                 x=torch.tensor([[1, 0], [2, 1]], dtype=torch.long),
                 edge_index=torch.tensor([[0], [1]], dtype=torch.long),
                 edge_attr=torch.tensor([1], dtype=torch.long),

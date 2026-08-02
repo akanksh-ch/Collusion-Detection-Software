@@ -1,168 +1,153 @@
-"""Multi-modal feature encoding: dual-track encoder + Gated Multimodal Fusion.
-
-Implements Module 3 of the production specification:
-
-  Topological Track  — Twin nn.Embedding → frozen GATConv with residual
-                       skip connections → Global Attention Pooling
-                       → V_topo ∈ R^D
-
-  Lexical Track      — char n-gram TF-IDF + layout metrics
-                       → TruncatedSVD projection → V_text ∈ R^D
-
-  Gated Multimodal   — V̄_topo = tanh(W_topo V_topo + b_topo)
-  Fusion (GMF)         V̄_text = tanh(W_text V_text + b_text)
-                       g       = σ(W_g [V̄_topo ∥ V̄_text] + b_g)
-                       V_prog  = g ⊙ V̄_topo + (1-g) ⊙ V̄_text
-
-Notes:
-  - GAT uses residual skip connections to prevent over-smoothing with
-    frozen random weights (diagnosed: 3-layer GAT collapsed cosine
-    similarities to 0.997–1.000 across all pairs).
-  - Text encoder uses TruncatedSVD (fitted on cohort) instead of a
-    frozen random nn.Linear, which compressed all variance into a
-    narrow cone (cosine sims 0.82–0.99).
-  - Fusion uses orthogonal weight init for better distance preservation.
+"""Dual-track submission encoder: graph2vec (topological) + TF-IDF/SVD (lexical),
+fused via L2-normalise + concatenate.
 """
 
 from __future__ import annotations
 
 import logging
+
+import networkx as nx
 import numpy as np
 import torch
 import torch.nn as nn
-from torch_geometric.nn import GATConv, global_mean_pool
+from karateclub import Graph2Vec
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
-from sklearn.preprocessing import normalize as sklearn_normalize
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 1. Topological Track — Graph Encoder (with residual skip connections)
+# 1. Topological Track — graph2vec (karateclub)
 # ══════════════════════════════════════════════════════════════════════
 
-class GraphEncoder(nn.Module):
-    """Untrained Deep GAT with residual connections acting as a continuous
-    topological projection hash.
+class GraphEncoder:
+    """Wraps karateclub's Graph2Vec so it plugs into the existing
+    encode_submission / MultiModalEncoder call sites.
 
-    Residual skip connections prevent the over-smoothing problem that
-    causes all vectors to collapse when using frozen random weights
-    through multiple message-passing layers.
+    Graph2Vec needs the full cohort up front (fit_corpus), then returns
+    per-graph embeddings either from the fitted model (in-sample) or
+    via .infer() for graphs seen after fitting (out-of-sample).
     """
 
     def __init__(
         self,
-        node_type_vocab_size: int,
+        node_type_vocab_size: int = 0,
         style_vocab_size: int = 5,
         edge_vocab_size: int = 10,
-        type_embed_dim: int = 48,
-        style_embed_dim: int = 16,
-        hidden_dim: int = 128,
         output_dim: int = 128,
-        heads: int = 4,
+        wl_iterations: int = 3,
+        epochs: int = 100,
+        min_count: int = 1,
+        seed: int = 90,
     ):
-        super().__init__()
-        self.type_embed_dim = type_embed_dim
-        self.style_embed_dim = style_embed_dim
-        cat_dim = type_embed_dim + style_embed_dim
+        # node_type_vocab_size / style_vocab_size / edge_vocab_size kept
+        # for call-site compatibility, unused (Graph2Vec hashes node
+        # features directly, no fixed vocab table needed).
+        self.output_dim = output_dim
+        self._model = Graph2Vec(
+            wl_iterations=wl_iterations,
+            attributed=True,
+            dimensions=output_dim,
+            epochs=epochs,
+            min_count=min_count,
+            seed=seed,
+        )
+        self._fitted = False
+        # graph identity -> index into the fitted corpus, so re-encoding
+        # a cohort graph returns its trained vector instead of re-inferring.
+        self._index_by_key: dict[int, int] = {}
+        self._trained_vectors: np.ndarray | None = None
 
-        # Twin embedding tables
-        self.type_embedding = nn.Embedding(node_type_vocab_size + 2, type_embed_dim)
-        self.style_embedding = nn.Embedding(style_vocab_size + 2, style_embed_dim)
-        self.edge_embedding = nn.Embedding(edge_vocab_size + 2, cat_dim)
+    def eval(self):
+        return self
 
-        # Input projection to hidden_dim for residual compatibility
-        self.input_proj = nn.Linear(cat_dim, hidden_dim)
+    def parameters(self):
+        return iter(())
 
-        # 2-layer GAT with residual connections (reduced from 3 to avoid
-        # over-smoothing with frozen weights)
-        self.conv1 = GATConv(hidden_dim, hidden_dim, heads=heads,
-                             concat=False, edge_dim=cat_dim)
-        self.conv2 = GATConv(hidden_dim, output_dim, heads=heads,
-                             concat=False, edge_dim=cat_dim)
+    @staticmethod
+    def _to_networkx(x: np.ndarray, edge_index: np.ndarray) -> nx.Graph:
+        """Build an undirected nx.Graph with a string "feature" attribute
+        per node (Graph2Vec's attributed mode expects this key)."""
+        g = nx.Graph()
+        for i, (node_type, style) in enumerate(x):
+            g.add_node(i, feature=f"{int(node_type)}_{int(style)}")
+        if edge_index.size:
+            for s, d in zip(edge_index[0], edge_index[1]):
+                g.add_edge(int(s), int(d))
+        return g
 
-        # Layer norms for stable residuals
-        self.ln1 = nn.LayerNorm(hidden_dim)
-        self.ln2 = nn.LayerNorm(output_dim)
+    @staticmethod
+    def _graph_key(x: np.ndarray, edge_index: np.ndarray) -> int:
+        return hash((x.tobytes(), edge_index.tobytes()))
 
-        self.relu = nn.ReLU()
+    def fit_corpus(self, graphs: list[dict]) -> None:
+        """Fit Graph2Vec once over the whole cohort.
 
-        # Output projection for residual dimension alignment
-        self.residual_proj = nn.Linear(hidden_dim, output_dim)
+        Args:
+            graphs: list of {"x": ndarray[N,2], "edge_index": ndarray[2,E]}
+        """
+        nx_graphs = []
+        keys = []
+        for g in graphs:
+            x_np = _to_numpy(g["x"]).astype(np.int64)
+            edge_index_np = _to_numpy(g["edge_index"]).astype(np.int64)
+            nx_graphs.append(self._to_networkx(x_np, edge_index_np))
+            keys.append(self._graph_key(x_np, edge_index_np))
 
-    def forward(self, x, edge_index, edge_attr=None, batch=None):
-        # x: [N, 2]  →  col 0 = x_type, col 1 = x_style
-        x_type = x[:, 0].long()
-        x_style = x[:, 1].long()
+        logging.info(f"[graph2vec] fitting Graph2Vec over {len(nx_graphs)} graphs")
+        self._model.fit(nx_graphs)
+        self._trained_vectors = self._model.get_embedding()
+        self._index_by_key = {k: i for i, k in enumerate(keys)}
+        self._fitted = True
 
-        h_type = self.type_embedding(x_type)
-        h_style = self.style_embedding(x_style)
-        h_cat = torch.cat([h_type, h_style], dim=-1)  # [N, cat_dim]
+    def __call__(self, x, edge_index, edge_attr=None, batch=None, debug: bool = False):
+        x_np = _to_numpy(x).astype(np.int64)
+        edge_index_np = _to_numpy(edge_index).astype(np.int64)
 
-        # Edge features
-        if edge_attr is not None and edge_index.size(1) > 0:
-            edge_feat = self.edge_embedding(edge_attr.long())
+        if not self._fitted:
+            raise RuntimeError("GraphEncoder.fit_corpus(...) must be called before encoding.")
+
+        key = self._graph_key(x_np, edge_index_np)
+        idx = self._index_by_key.get(key)
+        if idx is not None:
+            vec = self._trained_vectors[idx]
         else:
-            edge_feat = torch.zeros(
-                (edge_index.size(1), h_cat.size(-1)), device=h_cat.device
-            )
+            g = self._to_networkx(x_np, edge_index_np)
+            vec = self._model.infer([g])[0]
 
-        # Project to hidden_dim
-        h = self.relu(self.input_proj(h_cat))
+        if debug:
+            print(f"[graph2vec] nodes={x_np.shape[0]} edges={edge_index_np.shape[1]} "
+                  f"in_sample={idx is not None} norm={np.linalg.norm(vec):.4f}")
 
-        # Layer 1 with residual skip
-        h_res = h
-        h = self.relu(self.ln1(self.conv1(h, edge_index, edge_attr=edge_feat) + h_res))
+        return torch.from_numpy(np.asarray(vec, dtype=np.float32)).unsqueeze(0)
 
-        # Layer 2 with residual skip (project residual to output_dim)
-        h_res = self.residual_proj(h)
-        h = self.relu(self.ln2(self.conv2(h, edge_index, edge_attr=edge_feat) + h_res))
 
-        # Global mean pooling — every node contributes equally, giving a
-        # stable, size-normalised topological hash. (Uses global_mean_pool
-        # rather than an AttentionalAggregation gate_nn, since that gate
-        # is frozen/untrained and therefore assigns arbitrary, size-sensitive
-        # attention weights rather than a meaningful summary of the subgraph.)
-        if batch is None:
-            batch = torch.zeros(h.size(0), dtype=torch.long, device=h.device)
-        return global_mean_pool(h, batch)  # [1, output_dim]
+def _to_numpy(t) -> np.ndarray:
+    if t is None:
+        return np.empty(0)
+    return t.cpu().numpy() if hasattr(t, "cpu") else np.asarray(t)
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 2. Lexical Track — Text Encoder (TruncatedSVD-based)
+# 2. Lexical Track — char n-gram TF-IDF + layout metrics, SVD-projected
 # ══════════════════════════════════════════════════════════════════════
 
 class TextEncoder:
-    """Combines character n-gram TF-IDF with continuous layout metrics.
-
-    Uses TruncatedSVD fitted on the cohort corpus (instead of a frozen
-    random linear projection) to reduce the raw feature vector to R^D.
-    SVD preserves the principal variance directions, giving much better
-    pairwise distance discrimination.
-    """
-
     def __init__(self, output_dim: int = 128, max_tfidf_features: int = 256):
         self.output_dim = output_dim
         self.max_tfidf_features = max_tfidf_features
         self._tfidf_disabled = False
         self._svd_fitted = False
 
-        # Character n-gram TF-IDF
         self.char_tfidf = TfidfVectorizer(
-            analyzer="char_wb",
-            ngram_range=(3, 5),
-            max_features=max_tfidf_features,
+            analyzer="char_wb", ngram_range=(3, 5), max_features=max_tfidf_features,
         )
 
-        # Layout metric dimensionality
         self._layout_dim = 3
         self._raw_dim = max_tfidf_features + self._layout_dim
-
-        # TruncatedSVD for dimensionality reduction (fitted on cohort)
         self._svd_dim = min(output_dim, self._raw_dim - 1)
         self._svd = TruncatedSVD(n_components=self._svd_dim, random_state=42)
 
     def fit_cohort(self, stripped_texts: list[str], comment_texts: list[str]):
-        """Fit TF-IDF and SVD on the full cohort corpus."""
         clean = [t for t in stripped_texts if t.strip()]
         if not clean:
             self._tfidf_disabled = True
@@ -171,267 +156,154 @@ class TextEncoder:
         try:
             self.char_tfidf.fit(clean)
         except ValueError:
-            logging.warning("[TF-IDF] Empty corpus — fallback mode active.")
+            logging.warning("[TF-IDF] empty corpus, disabling")
             self._tfidf_disabled = True
             return
 
-        # Build raw feature matrix for the entire cohort
-        raw_matrix = []
-        for src, comments in zip(stripped_texts, comment_texts):
-            raw_vec = self._extract_raw_features(src, comments)
-            raw_matrix.append(raw_vec)
+        raw_matrix = np.array(
+            [self._extract_raw_features(s, c) for s, c in zip(stripped_texts, comment_texts)],
+            dtype=np.float64,
+        )
 
-        raw_matrix = np.array(raw_matrix, dtype=np.float64)
-
-        # Fit SVD on the cohort's raw feature space
         n_samples = raw_matrix.shape[0]
         effective_dim = min(self._svd_dim, n_samples - 1, raw_matrix.shape[1] - 1)
         if effective_dim < 1:
-            logging.warning("[SVD] Not enough samples for SVD — using raw features.")
+            logging.warning("[SVD] not enough samples, using raw features")
             return
 
         self._svd = TruncatedSVD(n_components=effective_dim, random_state=42)
         self._svd.fit(raw_matrix)
         self._svd_fitted = True
-        logging.info(
-            f"[TEXT ENCODER] SVD fitted: {raw_matrix.shape[1]}D → {effective_dim}D "
-            f"(explained variance: {self._svd.explained_variance_ratio_.sum():.2%})"
-        )
 
     def encode(self, stripped_source: str, comment_text: str = "") -> np.ndarray:
-        """Produce a D-dimensional text style vector for a single submission."""
         raw_vec = self._extract_raw_features(stripped_source, comment_text)
 
         if self._svd_fitted:
             projected = self._svd.transform(raw_vec.reshape(1, -1)).flatten()
         else:
-            # Fallback: truncate/pad to output_dim
-            projected = raw_vec[:self.output_dim]
-            if len(projected) < self.output_dim:
-                projected = np.pad(projected, (0, self.output_dim - len(projected)))
+            projected = raw_vec[: self.output_dim]
 
-        # Pad to output_dim if SVD produced fewer components
         if len(projected) < self.output_dim:
             projected = np.pad(projected, (0, self.output_dim - len(projected)))
 
-        # L2 normalise
         norm = np.linalg.norm(projected)
         if norm > 0:
             projected = projected / norm
         return projected.astype(np.float32)
 
     def _extract_raw_features(self, stripped_source: str, comment_text: str) -> np.ndarray:
-        """Extract the raw (un-projected) feature vector."""
-        # TF-IDF features
-        if (stripped_source.strip()
-                and not self._tfidf_disabled
-                and hasattr(self.char_tfidf, "vocabulary_")):
+        if stripped_source.strip() and not self._tfidf_disabled and hasattr(self.char_tfidf, "vocabulary_"):
             try:
-                tfidf_vec = self.char_tfidf.transform(
-                    [stripped_source]
-                ).toarray().flatten()
+                tfidf_vec = self.char_tfidf.transform([stripped_source]).toarray().flatten()
             except ValueError:
                 tfidf_vec = np.zeros(self.max_tfidf_features)
         else:
             tfidf_vec = np.zeros(self.max_tfidf_features)
 
-        # Layout metrics
+        if len(tfidf_vec) < self.max_tfidf_features:
+            tfidf_vec = np.pad(tfidf_vec, (0, self.max_tfidf_features - len(tfidf_vec)))
+
         lines = stripped_source.splitlines()
-        total_lines = max(len(lines), 1)
+        n_lines = max(len(lines), 1)
+        avg_line_len = np.mean([len(l) for l in lines]) if lines else 0.0
+        comment_ratio = len(comment_text) / max(len(stripped_source), 1)
+        blank_ratio = sum(1 for l in lines if not l.strip()) / n_lines
 
-        leading_counts = []
-        for ln in lines:
-            stripped = ln.lstrip()
-            indent = ln[: len(ln) - len(stripped)]
-            leading_counts.append(indent.count("\t") - indent.count(" "))
-        tabs_spaces_var = float(np.var(leading_counts)) if leading_counts else 0.0
-
-        blank_count = sum(1 for ln in lines if not ln.strip())
-        blank_ratio = blank_count / total_lines
-
-        code_chars = max(
-            len(stripped_source.replace(" ", "").replace("\n", "")), 1
-        )
-        comment_chars = len(comment_text.replace(" ", "").replace("\n", ""))
-        comment_density = comment_chars / (comment_chars + code_chars)
-
-        layout = np.array(
-            [tabs_spaces_var, blank_ratio, comment_density], dtype=np.float64
-        )
-
-        return np.concatenate([tfidf_vec, layout])
+        return np.concatenate([tfidf_vec, np.array([avg_line_len, comment_ratio, blank_ratio])])
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 3. Gated Multimodal Fusion
+# 3. Fusion — per-channel L2-normalise, concatenate, re-normalise
 # ══════════════════════════════════════════════════════════════════════
 
-class GatedMultimodalFusion(nn.Module):
-    """Implements the exact GMF equations from the specification.
-
-    Uses orthogonal weight initialisation for better distance preservation
-    through the gating network.
-    """
-
+class ConcatFusion(nn.Module):
     def __init__(self, dim: int = 128):
         super().__init__()
-        self.proj_topo = nn.Linear(dim, dim)
-        self.proj_text = nn.Linear(dim, dim)
-        self.gate = nn.Linear(2 * dim, dim)
-
-        # Orthogonal init for distance-preserving projections
-        nn.init.orthogonal_(self.proj_topo.weight)
-        nn.init.orthogonal_(self.proj_text.weight)
-        nn.init.orthogonal_(self.gate.weight)
+        self.dim = dim
 
     def forward(self, v_topo: torch.Tensor, v_text: torch.Tensor) -> torch.Tensor:
-        v_topo_bar = torch.tanh(self.proj_topo(v_topo))
-        v_text_bar = torch.tanh(self.proj_text(v_text))
-
-        g = torch.sigmoid(
-            self.gate(torch.cat([v_topo_bar, v_text_bar], dim=-1))
-        )
-        v_program = g * v_topo_bar + (1 - g) * v_text_bar
-        return v_program
+        v_topo_hat = torch.nn.functional.normalize(v_topo, p=2, dim=-1)
+        v_text_hat = torch.nn.functional.normalize(v_text, p=2, dim=-1)
+        v_program = torch.cat([v_topo_hat, v_text_hat], dim=-1)
+        return torch.nn.functional.normalize(v_program, p=2, dim=-1)
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 4. Orchestrator: MultiModalEncoder
+# 4. Orchestrator
 # ══════════════════════════════════════════════════════════════════════
 
 class MultiModalEncoder:
-    """Top-level encoder wrapping both tracks and the fusion module.
-
-    Returns all three vectors per submission (V_topo, V_text, V_program)
-    so that the analyser can perform forensic disaggregation on the
-    decoupled components.
-
-    Calibration strategy (All-But-The-Top):
-      During ``fit_cohort()`` we compute and permanently freeze:
-        1. The cohort mean vector for each embedding space.
-        2. The top-K dominant principal components (K determined
-           dynamically from the singular value spectrum).
-      During ``encode_submission()`` we apply those frozen parameters
-      to incoming vectors: subtract the mean, project out the top-K
-      PCs, and re-normalise.  No per-batch refitting occurs.
-
-      This guarantees that isotropic calibration only stabilises the
-      cosine distance metric; the similarity threshold (e.g. 0.85) is
-      derived empirically via precision-recall tuning against the
-      labelled ground-truth corpus.
-    """
-
     def __init__(
         self,
         node_type_vocab_size: int,
         edge_vocab_size: int,
         dim: int = 128,
         style_vocab_size: int = 5,
+        seed: int = 90,
+        graph2vec_epochs: int = 100,
+        graph2vec_wl_iterations: int = 3,
     ):
         self.dim = dim
+        self.seed = seed
 
-        # Topological track
         self.graph_encoder = GraphEncoder(
             node_type_vocab_size=node_type_vocab_size,
             style_vocab_size=style_vocab_size,
             edge_vocab_size=edge_vocab_size,
             output_dim=dim,
+            wl_iterations=graph2vec_wl_iterations,
+            epochs=graph2vec_epochs,
+            seed=seed,
         )
         self.graph_encoder.eval()
-        for param in self.graph_encoder.parameters():
-            param.requires_grad = False
 
-        # Lexical track
         self.text_encoder = TextEncoder(output_dim=dim)
 
-        # Gated Multimodal Fusion
-        self.fusion = GatedMultimodalFusion(dim=dim)
+        self.fusion = ConcatFusion(dim=dim)
         self.fusion.eval()
-        for param in self.fusion.parameters():
-            param.requires_grad = False
 
-        # ── Frozen calibration state (set by fit_cohort) ─────────────
-        self._calibrated: bool = False
-        self._cohort_mean: dict[str, np.ndarray] = {}    # space → mean vec
-        self._cohort_top_pcs: dict[str, np.ndarray] = {} # space → (K, D) PC matrix
+        self._calibrated = False
+        self._cohort_mean: dict[str, np.ndarray] = {}
+        self._cohort_top_pcs: dict[str, np.ndarray] = {}
 
-    def fit_text_cohort(
-        self,
-        stripped_texts: list[str],
-        comment_texts: list[str] | None = None,
-    ):
-        """Fit the text encoder's TF-IDF + SVD on the cohort corpus.
-
-        .. deprecated:: Use ``fit_cohort`` instead, which also computes
-           and freezes isotropic calibration parameters.
-        """
+    def fit_text_cohort(self, stripped_texts: list[str], comment_texts: list[str] | None = None):
         if comment_texts is None:
             comment_texts = [""] * len(stripped_texts)
         self.text_encoder.fit_cohort(stripped_texts, comment_texts)
 
-    # ------------------------------------------------------------------
-    # Stateful cohort calibration (All-But-The-Top)
-    # ------------------------------------------------------------------
-    def fit_cohort(
-        self,
-        cohort_pyg: dict,
-        stripped_texts: list[str],
-        comment_texts: list[str],
-    ):
-        """Fit all learnable parameters AND freeze calibration state.
-
-        This method:
-          1. Fits the lexical encoder's TF-IDF + SVD.
-          2. Encodes every submission (uncalibrated).
-          3. For each vector space (v_topo, v_text, v_program):
-             a. Computes and stores the cohort mean.
-             b. Inspects the singular value spectrum of the centred
-                matrix to dynamically determine K — the number of
-                dominant principal components to remove.
-             c. Stores the top-K PCs.
-          4. Sets ``_calibrated = True``.
-
-        After this call, ``encode_submission`` will automatically apply
-        the frozen calibration parameters to every new vector.
-        """
+    def fit_cohort(self, cohort_pyg: dict, stripped_texts: list[str], comment_texts: list[str]):
         student_ids = list(cohort_pyg.keys())
 
-        # Step 1 — fit the text encoder's TF-IDF + SVD
+        # Fit graph2vec over the whole cohort first — everything else
+        # (text SVD, ABTT calibration) depends on encode_submission,
+        # which needs a fitted graph encoder.
+        graphs_for_fit = [
+            {"x": cohort_pyg[sid].x, "edge_index": cohort_pyg[sid].edge_index}
+            for sid in student_ids
+        ]
+        self.graph_encoder.fit_corpus(graphs_for_fit)
+
         self.fit_text_cohort(stripped_texts, comment_texts)
 
-        # Step 2 — encode the entire cohort (uncalibrated)
-        raw_vecs: dict[str, dict[str, np.ndarray]] = {}
-        for idx, sid in enumerate(student_ids):
-            raw_vecs[sid] = self.encode_submission(
-                cohort_pyg[sid], stripped_texts[idx], comment_texts[idx],
-            )
+        raw_vecs = {
+            sid: self.encode_submission(cohort_pyg[sid], stripped_texts[i], comment_texts[i])
+            for i, sid in enumerate(student_ids)
+        }
 
-        # Step 3 — compute calibration parameters per vector space
         for space in ("v_topo", "v_text", "v_program"):
             mat = np.stack([raw_vecs[sid][space] for sid in student_ids])
             mean = mat.mean(axis=0)
             self._cohort_mean[space] = mean
 
             centred = mat - mean[np.newaxis, :]
-
-            # SVD on the centred matrix to inspect the spectrum
             n, d = centred.shape
-            max_components = min(n, d)
-            if max_components < 2:
+            if min(n, d) < 2:
                 self._cohort_top_pcs[space] = np.empty((0, d), dtype=np.float32)
-                logging.info(
-                    f"[CALIBRATION] {space}: too few samples for spectrum "
-                    f"analysis — skipping PC removal."
-                )
                 continue
 
-            U, S, Vt = np.linalg.svd(centred, full_matrices=False)
+            _, S, Vt = np.linalg.svd(centred, full_matrices=False)
             explained = (S ** 2) / np.sum(S ** 2)
 
-            # Dynamically decide K: drop components whose explained
-            # variance ratio exceeds the isotropy expectation by ≥3×.
-            # For a perfectly isotropic D-dimensional space each PC
-            # would explain 1/D of the variance.
             iso_baseline = max(3.0 * (1.0 / d), 0.05)
             K = 0
             for k_idx in range(min(3, len(explained))):
@@ -441,62 +313,29 @@ class MultiModalEncoder:
                     break
 
             self._cohort_top_pcs[space] = Vt[:K].astype(np.float32)
-
-            # Logging for dissertation evidence
-            top_vals = ", ".join(f"{v:.4f}" for v in explained[:5])
-            logging.info(
-                f"[CALIBRATION] {space}: singular value spectrum "
-                f"(top-5 explained variance): [{top_vals}]  →  "
-                f"dropping K={K} dominant PC(s)  "
-                f"(isotropy baseline: {iso_baseline:.4f})"
-            )
+            logging.info(f"[CALIBRATION] {space}: dropping top-{K} PC(s)")
 
         self._calibrated = True
-        logging.info("[CALIBRATION] Frozen calibration parameters stored.")
 
     def encode_submission(
-        self,
-        pyg_data,
-        stripped_source: str = "",
-        comment_text: str = "",
+        self, pyg_data, stripped_source: str = "", comment_text: str = "", debug: bool = False,
     ) -> dict:
-        """Encode a single submission → decoupled + fused vectors.
-
-        If ``fit_cohort`` has been called, the frozen calibration
-        parameters (mean subtraction + top-K PC removal) are applied
-        automatically.  No per-batch refitting occurs.
-
-        Returns dict with ``v_topo``, ``v_text``, ``v_program`` —
-        each an L2-normalised ``np.ndarray`` of shape ``(D,)``.
-        """
-        # ── Topological vector ───────────────────────────────────────
         num_nodes = pyg_data.x.size(0) if pyg_data.x is not None else 0
         if num_nodes == 0:
             v_topo = np.zeros(self.dim, dtype=np.float32)
         else:
-            x = pyg_data.x.long()
-            edge_attr = (
-                pyg_data.edge_attr if hasattr(pyg_data, "edge_attr") else None
-            )
-            if edge_attr is not None and edge_attr.dim() > 1:
-                edge_attr = edge_attr.squeeze(-1)
-
             with torch.no_grad():
                 v_topo = (
-                    self.graph_encoder(x, pyg_data.edge_index, edge_attr)
-                    .cpu()
-                    .numpy()
-                    .flatten()
+                    self.graph_encoder(pyg_data.x.long(), pyg_data.edge_index, debug=debug)
+                    .cpu().numpy().flatten()
                 )
 
         norm = np.linalg.norm(v_topo)
         if norm > 0:
             v_topo = v_topo / norm
 
-        # ── Lexical vector ───────────────────────────────────────────
         v_text = self.text_encoder.encode(stripped_source, comment_text)
 
-        # ── Gated Multimodal Fusion ──────────────────────────────────
         with torch.no_grad():
             t_topo = torch.from_numpy(v_topo).unsqueeze(0).float()
             t_text = torch.from_numpy(v_text).unsqueeze(0).float()
@@ -512,69 +351,30 @@ class MultiModalEncoder:
             "v_program": v_program.astype(np.float32),
         }
 
-        # Apply frozen calibration if available
         if self._calibrated:
             for space in ("v_topo", "v_text", "v_program"):
-                result[space] = self._apply_calibration(
-                    result[space], space
-                )
+                result[space] = self._apply_calibration(result[space], space)
 
         return result
 
-    def _apply_calibration(
-        self, vec: np.ndarray, space: str,
-    ) -> np.ndarray:
-        """Apply frozen All-But-The-Top calibration to a single vector.
-
-        Steps:
-          1. Subtract the cohort mean for this space.
-          2. Remove the projections onto the top-K principal components.
-          3. L2-normalise.
-
-        This uses only the parameters frozen during ``fit_cohort``;
-        no per-batch refitting occurs.
-        """
+    def _apply_calibration(self, vec: np.ndarray, space: str) -> np.ndarray:
         vec = vec - self._cohort_mean[space]
-
-        top_pcs = self._cohort_top_pcs[space]  # (K, D) or (0, D)
+        top_pcs = self._cohort_top_pcs[space]
         if top_pcs.shape[0] > 0:
-            # Project out dominant directions:
-            #   v' = v - Σ_k (v · pc_k) pc_k
-            projections = top_pcs @ vec           # (K,)
-            vec = vec - top_pcs.T @ projections   # (D,)
+            vec = vec - top_pcs.T @ (top_pcs @ vec)
 
         norm = np.linalg.norm(vec)
         if norm > 1e-8:
             vec = vec / norm
-
         return vec.astype(np.float32)
 
     @staticmethod
     def mean_center_vectors(vectors: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        """Remove the common mode from a cohort of vectors and re-normalise.
-
-        .. deprecated:: Superseded by the stateful ``fit_cohort`` +
-           ``_apply_calibration`` pipeline which also removes dominant
-           principal components (All-But-The-Top).  Retained for
-           backward compatibility.
-
-        Args:
-            vectors: mapping ``student_id → vector (D,)``
-
-        Returns:
-            New mapping with mean-centered, L2-normalised vectors.
-        """
         if not vectors:
             return vectors
-
         ids = list(vectors.keys())
         mat = np.stack([vectors[sid] for sid in ids])
-        mean = mat.mean(axis=0, keepdims=True)
-        centered = mat - mean
-
-        # Re-normalise to unit sphere
-        norms = np.linalg.norm(centered, axis=1, keepdims=True)
-        norms = np.maximum(norms, 1e-8)
+        centered = mat - mat.mean(axis=0, keepdims=True)
+        norms = np.maximum(np.linalg.norm(centered, axis=1, keepdims=True), 1e-8)
         centered = centered / norms
-
         return {sid: centered[i].astype(np.float32) for i, sid in enumerate(ids)}
