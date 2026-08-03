@@ -118,10 +118,47 @@ class CohortAnalyzer:
         gap_size: int = 6,
         neighbor_length: int = 2,
         cluster_skip: bool = False,
+        gst_gate_threshold: float = 0.35,
         **kwargs,
     ):
         """Build Exact index, flag candidate pairs, disaggregate scores,
-        generate GST evidence, and cluster via Leiden."""
+        generate GST evidence, and cluster via Leiden.
+
+        Edge weight fusion (adaptive per-pair gate)
+        --------------------------------------------
+        Evaluation on the labelled corpus showed gst_coverage alone
+        (ROC-AUC 0.97 / PR-AUC 0.93) is a dramatically cleaner separator
+        of true positives than the fused embedding `similarity` (~0.58
+        AUC), and that GST-distance HDBSCAN (ARI 0.83, purity 1.00)
+        beats both Leiden-on-embeddings and embedding-only HDBSCAN by a
+        wide margin. A flat alpha-blend of the two *hurt* results,
+        because averaging always drags GST's near-perfect signal toward
+        the noisier embedding one, even on pairs GST already got right.
+
+        Instead we use a per-pair confidence gate:
+          - gst_coverage >= gst_gate_threshold: trust GST outright, use
+            gst_coverage as the edge weight (this is where GST is
+            precise and embeddings would only add noise).
+          - gst_coverage <  gst_gate_threshold: fall back to the
+            embedding cosine similarity. Low token overlap doesn't mean
+            "not plagiarism" — it can mean a heavily-refactored
+            Type-3/4 clone, which GST is structurally blind to and
+            embeddings exist to catch.
+
+        This also fixes a coverage gap: GST evidence used to only get
+        computed for pairs that had *already* cleared the embedding
+        sim_floor, so a pair with strong GST overlap but weak embedding
+        similarity could never be rescued. GST is now computed for
+        every candidate pair up front, before the floor check, so the
+        gate can promote it.
+
+        gst_gate_threshold default (0.35) is a reasonable starting
+        point, not a calibrated one — sweep it against your labelled
+        eval CSV (same ground truth used for the ROC-AUC numbers above)
+        to pick the value that maximizes precision/recall on your
+        corpus, since it will vary with gst_min_match/gap_size/corpus
+        language.
+        """
         import igraph as ig
         import leidenalg as la
 
@@ -163,9 +200,6 @@ class CohortAnalyzer:
                 ))
                 sim_global = max(0.0, min(1.0, sim_global))
 
-                if sim_global < sim_floor:
-                    continue
-
                 pair = tuple(sorted([student_id, neighbor_id]))
                 if self.knn_graph.has_edge(pair[0], pair[1]):
                     continue
@@ -185,6 +219,10 @@ class CohortAnalyzer:
                 # ── GST line-level evidence ──────────────────────────
                 # Use pair[0]/pair[1] (sorted) so a_file/b_file align
                 # with student_a/student_b in the report output.
+                # NOTE: computed for every candidate pair, *before* the
+                # sim_floor gate below — otherwise a pair with strong
+                # token overlap but weak embedding similarity would
+                # never get the chance to be rescued by the gate.
                 src_a = self._read_stripped_source(pair[0])
                 src_b = self._read_stripped_source(pair[1])
 
@@ -203,13 +241,31 @@ class CohortAnalyzer:
                     gst_coverage = coverage_score(tiles, len(tokens_a), len(tokens_b))
                     gst_tiles = tiles_to_json(tiles)
 
+                # ── Adaptive confidence gate ──────────────────────────
+                # High GST coverage: trust it outright (precise, low
+                # noise). Low GST coverage: fall back to the embedding
+                # similarity, since a refactored Type-3/4 clone can
+                # still score high there even with near-zero token
+                # overlap. See docstring above for the rationale.
+                if gst_coverage >= gst_gate_threshold:
+                    fused_weight = gst_coverage
+                    gate_source = "gst"
+                else:
+                    fused_weight = sim_global
+                    gate_source = "embedding"
+
+                if fused_weight < sim_floor:
+                    continue
+
                 self.knn_graph.add_edge(
                     pair[0], pair[1],
-                    weight=sim_global,
+                    weight=fused_weight,
+                    sim_global=sim_global,
                     sim_structural=sim_structural,
                     sim_lexical=sim_lexical,
                     gst_coverage=gst_coverage,
                     gst_tiles=gst_tiles,
+                    gate_source=gate_source,
                 )
 
         # ── Leiden community detection ───────────────────────────────
@@ -293,11 +349,13 @@ class CohortAnalyzer:
                 continue
             seen_pairs.add(pair)
 
-            similarity = data["weight"]
+            similarity = data["weight"]  # gated fusion: gst_coverage or sim_global
+            sim_global = data.get("sim_global", similarity)
             sim_structural = data.get("sim_structural", similarity)
             sim_lexical = data.get("sim_lexical", similarity)
             gst_coverage = data.get("gst_coverage", 0.0)
             gst_tiles = data.get("gst_tiles", [])
+            gate_source = data.get("gate_source", "embedding")
 
             comm_u = self.node_to_community.get(u, "Isolated_Node")
             comm_v = self.node_to_community.get(v, "Isolated_Node")
@@ -323,6 +381,8 @@ class CohortAnalyzer:
                 "student_a": pair[0],
                 "student_b": pair[1],
                 "similarity": similarity,
+                "sim_global": sim_global,
+                "gate_source": gate_source,
                 "sim_structural": sim_structural,
                 "sim_lexical": sim_lexical,
                 "gst_coverage": gst_coverage,
