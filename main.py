@@ -92,6 +92,12 @@ def main():
     parser.add_argument("--gap-size", type=int, default=6)
     parser.add_argument("--neighbor-length", type=int, default=2)
     parser.add_argument("--cluster-skip", action="store_true")
+    parser.add_argument(
+        "--export-embeddings", type=str, default=None,
+        metavar="PATH",
+        help="Dump per-submission v_topo/v_text/v_program vectors to PATH "
+             "(.npz) for offline analysis (e.g. t-SNE/UMAP).",
+    )
 
     args = parser.parse_args()
 
@@ -221,6 +227,26 @@ def main():
         workspace_dir=workspace_dir,
     )
     analyzer.generate_all_embeddings()
+
+    if args.export_embeddings:
+        import numpy as np
+
+        student_ids = analyzer.student_ids
+        export_payload = {"student_ids": np.array(student_ids, dtype=object)}
+        for space, attr in (
+            ("v_topo", "vectors_topo"),
+            ("v_text", "vectors_text"),
+            ("v_program", "vectors_program"),
+        ):
+            vec_dict = getattr(analyzer, attr, None)
+            if vec_dict:
+                export_payload[space] = np.stack([vec_dict[sid] for sid in student_ids])
+
+        np.savez_compressed(args.export_embeddings, **export_payload)
+        logging.info(
+            f"[EXPORT] Saved {len(student_ids)} submission embeddings "
+            f"→ {args.export_embeddings}"
+        )
 
     # ── Step 4: HNSW search + disaggregation + GST + Leiden ──────────
     logging.info("Step 4: HNSW indexing, forensic disaggregation, GST evidence, Leiden clustering...")
