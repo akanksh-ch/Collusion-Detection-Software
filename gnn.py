@@ -50,6 +50,13 @@ class GraphEncoder:
             epochs=epochs,
             min_count=min_count,
             seed=seed,
+            # gensim's Doc2Vec training underneath Graph2Vec is only
+            # deterministic (given a fixed seed) with workers=1 — multi-
+            # threaded accumulation order changes float summation order.
+            # NOTE: this alone is NOT sufficient for full reproducibility;
+            # gensim's vocab hashing also depends on Python's per-process
+            # str hash(), which needs PYTHONHASHSEED pinned (see Dockerfile).
+            workers=1,
         )
         self._fitted = False
         # graph identity -> index into the fitted corpus, so re-encoding
