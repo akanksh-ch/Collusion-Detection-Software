@@ -9,7 +9,9 @@ source ranges for the forensic diff sidebar.
 
 from __future__ import annotations
 
+import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
@@ -79,10 +81,45 @@ def tokenize_source(sources: dict[str, str]) -> List[Token]:
 # Greedy String Tiling core
 # ──────────────────────────────────────────────────────────────────────
 
+class _NextUnmarked:
+    """Union-find with path compression, used to skip already-marked
+    token positions in amortized ~O(1) instead of walking them one at a
+    time on every outer-loop pass.
+
+    ``find(i)`` returns the smallest unmarked index >= i (or n if none
+    remain). ``mark(i)`` records that index i is now marked, so future
+    ``find`` calls jump straight past it. Without this, a pair that
+    needs H outer-loop passes to fully tile pays O(n) per pass just to
+    walk past previously-marked tokens — O(n * H) total. With it, the
+    total cost of all skipping across every pass combined is amortized
+    O(n) for the whole match, regardless of H.
+    """
+    __slots__ = ("parent",)
+
+    def __init__(self, n: int):
+        # index n is a sentinel representing "past the end"
+        self.parent = list(range(n + 1))
+
+    def find(self, x: int) -> int:
+        root = x
+        while self.parent[root] != root:
+            root = self.parent[root]
+        while self.parent[x] != root:
+            self.parent[x], x = root, self.parent[x]
+        return root
+
+    def mark(self, i: int) -> None:
+        self.parent[i] = self.find(i + 1)
+
+
 def greedy_string_tiling(
     tokens_a: List[Token],
     tokens_b: List[Token],
     min_match_length: int = 8,
+    max_bucket_size: int = 60,
+    max_outer_iterations: int = 2000,
+    max_seconds: float = 20.0,
+    pair_label: str = "",
 ) -> List[Tile]:
     """Run Greedy String Tiling on two token sequences.
 
@@ -98,6 +135,40 @@ def greedy_string_tiling(
             3. Mark matched tokens so they cannot be reused.
             
     Optimized with an n-gram dictionary to avoid O(N*M) scanning.
+
+    Three safety valves against pathological worst cases (near-duplicate
+    pairs and boilerplate-heavy corpora):
+
+    - Skip pointers (``_NextUnmarked``): the outer loop used to rescan
+      every position ``i`` from 0..n on *every* pass, stepping past
+      already-marked tokens one at a time. For a pair needing H passes
+      that's O(n * H) just to walk past marked tokens — on a
+      near-duplicate pair (exactly what this tool exists to catch)
+      that can mean hundreds of passes, each rescanning the full
+      stream, and it's invisible in a per-N-pairs progress log because
+      one slow pair blends into the averaged rate. A union-find
+      "next unmarked" pointer with path compression makes the total
+      cost of skipping marked tokens across all passes combined
+      amortized O(n) for the whole match, regardless of H.
+    - ``max_bucket_size``: an n-gram shared by more than this many
+      positions in B is treated as boilerplate rather than distinctive
+      evidence and is skipped entirely for matching. This is not just
+      a perf hack — an n-gram common to dozens of unrelated submissions
+      (e.g. shared imports, `public static void main`) isn't real
+      similarity signal anyway, so dropping it also slightly improves
+      precision, not just speed.
+    - ``max_outer_iterations`` / ``max_seconds``: hard caps on how many
+      times the find-longest-then-mark outer loop can run, and on
+      total wall-clock time, for a single pair. Iteration count alone
+      doesn't protect against a single huge ``n`` — a pair could still
+      take a long time before hitting the iteration cap — so wall
+      clock is checked too (every 25 iterations, to keep the check
+      itself cheap). Hitting either cap logs a warning (including
+      ``pair_label`` if provided) and returns whatever tiles have been
+      found so far rather than continuing — this should only ever
+      trigger on genuinely pathological pairs, and a slightly
+      incomplete tile set for one outlier pair is far preferable to
+      stalling the entire corpus run.
     """
     n = len(tokens_a)
     m = len(tokens_b)
@@ -113,24 +184,63 @@ def greedy_string_tiling(
     vals_a = [t.value for t in tokens_a]
     vals_b = [t.value for t in tokens_b]
 
-    # Prebuild index for B
+    # Prebuild index for B, dropping over-common ("boilerplate") n-grams
     b_index = {}
+    dropped_ngrams = 0
     for j in range(m - min_match_length + 1):
         ngram = tuple(vals_b[j : j + min_match_length])
         if ngram not in b_index:
             b_index[ngram] = []
         b_index[ngram].append(j)
 
+    for ngram, positions in list(b_index.items()):
+        if len(positions) > max_bucket_size:
+            dropped_ngrams += 1
+            del b_index[ngram]
+
+    if dropped_ngrams:
+        logging.debug(
+            f"[GST] dropped {dropped_ngrams} boilerplate n-gram bucket(s) "
+            f"exceeding max_bucket_size={max_bucket_size}"
+        )
+
+    skip_a = _NextUnmarked(n)
+    skip_b = _NextUnmarked(m)
+
+    start_time = time.monotonic()
+    outer_iterations = 0
+    label_suffix = f" [{pair_label}]" if pair_label else ""
     while True:
+        outer_iterations += 1
+        if outer_iterations > max_outer_iterations:
+            logging.warning(
+                f"[GST] hit max_outer_iterations={max_outer_iterations} on a "
+                f"pair (n={n}, m={m}){label_suffix} — likely a near-duplicate "
+                f"or highly repetitive pair. Returning {len(tiles)} tile(s) "
+                f"found so far rather than continuing indefinitely."
+            )
+            break
+
+        # Wall-clock backstop, checked periodically (not every iteration)
+        # so the time.monotonic() call itself doesn't add meaningful
+        # overhead on pairs with many cheap passes.
+        if outer_iterations % 25 == 0:
+            elapsed = time.monotonic() - start_time
+            if elapsed > max_seconds:
+                logging.warning(
+                    f"[GST] hit max_seconds={max_seconds:.0f}s on a pair "
+                    f"(n={n}, m={m}){label_suffix} after {outer_iterations} "
+                    f"passes — likely a near-duplicate or highly repetitive "
+                    f"pair. Returning {len(tiles)} tile(s) found so far "
+                    f"rather than continuing indefinitely."
+                )
+                break
+
         max_match = min_match_length
         matches = []
 
-        i = 0
+        i = skip_a.find(0)
         while i < n - max_match + 1:
-            if marked_a[i]:
-                i += 1
-                continue
-
             ngram = tuple(vals_a[i : i + min_match_length])
             if ngram in b_index:
                 for j in b_index[ngram]:
@@ -149,7 +259,7 @@ def greedy_string_tiling(
                             max_match = k
                             matches = []
                         matches.append((i, j, k))
-            i += 1
+            i = skip_a.find(i + 1)
 
         if not matches:
             break
@@ -165,6 +275,8 @@ def greedy_string_tiling(
             for d in range(length):
                 marked_a[i + d] = True
                 marked_b[j + d] = True
+                skip_a.mark(i + d)
+                skip_b.mark(j + d)
 
             tile_tokens_a = tokens_a[i: i + length]
             tile_tokens_b = tokens_b[j: j + length]

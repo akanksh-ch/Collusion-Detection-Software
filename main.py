@@ -3,7 +3,7 @@
 Wires up all four backend modules with correct data handoff:
   1. parse.py    — comment stripping + Joern compilation
   2. loader.py   — template masking, slicing, casing, tensorisation
-  3. gnn.py      — dual-track encoding + Gated Multimodal Fusion
+  3. gnn.py       — dual-track encoding + Gated Multimodal Fusion
   4. analyser.py — HNSW search, disaggregation, GST, Leiden
 """
 
@@ -39,7 +39,6 @@ def main():
     )
 
     # ── Core parameters (JPlag-compatible names) ─────────────────────
-    # Changed to action="append" to support multiple roots natively
     parser.add_argument(
         "--src", type=str, action="append", default=None,
         help="Root directory with submissions to check for plagiarism. Specify multiple times for multiple roots.",
@@ -93,10 +92,34 @@ def main():
     parser.add_argument("--neighbor-length", type=int, default=2)
     parser.add_argument("--cluster-skip", action="store_true")
     parser.add_argument(
+        "--cluster-method", type=str, default="leiden",
+        choices=["leiden", "hdbscan"],
+        help="Family/community assignment method (default: leiden). "
+             "'hdbscan' clusters graph2vec + TF-IDF stylometric "
+             "embeddings instead of the fused GST/embedding graph. "
+             "GST computation and the pairwise report are IDENTICAL "
+             "either way — only family assignment changes. Requires "
+             "karateclub to be installed.",
+    )
+    parser.add_argument("--hdbscan-structural-weight", type=float, default=0.7,
+        help="Weight for graph2vec vectors when --cluster-method=hdbscan (default 0.7).")
+    parser.add_argument("--hdbscan-stylometric-weight", type=float, default=0.3,
+        help="Weight for TF-IDF stylometric vectors when --cluster-method=hdbscan (default 0.3).")
+    parser.add_argument("--hdbscan-min-cluster-size", type=int, default=2,
+        help="min_cluster_size for HDBSCAN when --cluster-method=hdbscan (default 2).")
+    parser.add_argument(
         "--export-embeddings", type=str, default=None,
         metavar="PATH",
-        help="Dump per-submission v_topo/v_text/v_program vectors to PATH "
-             "(.npz) for offline analysis (e.g. t-SNE/UMAP).",
+        help="Dump per-submission v_topo/v_text/v_program/v_g2v/v_stylo vectors "
+             "to PATH (.npz) for offline analysis (e.g. HDBSCAN, t-SNE/UMAP).",
+    )
+    parser.add_argument(
+        "--no-structural-stylo", action="store_true",
+        help="Skip graph2vec + TF-IDF embedding generation even when "
+             "--export-embeddings is set (they're otherwise generated "
+             "automatically alongside v_topo/v_text/v_program). Useful "
+             "if karateclub isn't installed or you just want the "
+             "original three spaces faster.",
     )
 
     args = parser.parse_args()
@@ -110,7 +133,7 @@ def main():
 
     if os.path.exists(args.out) and not args.overwrite:
         if os.path.isfile(args.out):
-            pass 
+            pass
 
     if args.subdirectory:
         args.src = [os.path.join(path, "*", args.subdirectory) for path in args.src]
@@ -167,7 +190,7 @@ def main():
             base_name = os.path.basename(args.skeleton.rstrip("/\\"))
             stem, _ = os.path.splitext(base_name)
             candidate_graphml = os.path.join(workspace_dir, f"{stem}.graphml")
-            
+
             if os.path.exists(candidate_graphml):
                 logging.info(f"[MASKING] Found pre-compiled GraphML for skeleton: {candidate_graphml}")
                 skeleton_graphml_path = candidate_graphml
@@ -177,24 +200,23 @@ def main():
                 skel_comments_dir = os.path.join(workspace_dir, "_comments_skeleton")
                 os.makedirs(skel_stripped_dir, exist_ok=True)
                 os.makedirs(skel_comments_dir, exist_ok=True)
-                
+
                 from parse import _preprocess_single_submission_worker, _parse_single_submission
-                
-                # Added the 4th argument stem string 'skeleton'
+
                 prep_args = (args.skeleton, skel_stripped_dir, skel_comments_dir, "skeleton")
                 stem_id, prep_status = _preprocess_single_submission_worker(prep_args)
-                
+
                 if prep_status == "OK":
                     stripped_skel_path = os.path.join(skel_stripped_dir, "skeleton")
-                    
+
                     parse_args = (
-                        stripped_skel_path, 
-                        workspace_dir, 
-                        j_parser.parse_bin, 
+                        stripped_skel_path,
+                        workspace_dir,
+                        j_parser.parse_bin,
                         j_parser.export_bin
                     )
                     skel_id, parse_status = _parse_single_submission(parse_args)
-                    
+
                     if parse_status in ("SUCCESS", "CACHED"):
                         skeleton_graphml_path = os.path.join(workspace_dir, f"{skel_id}.graphml")
                         logging.info(f"[MASKING] Successfully compiled skeleton to: {skeleton_graphml_path}")
@@ -218,12 +240,17 @@ def main():
     logging.info(f"  → Loaded {len(cohort_graphs)} student graphs.")
 
     # ── Step 3: Generate multi-modal embeddings ───────────────────────
+    # analyzer is bound here, and must stay bound before anything below
+    # this point references it — the embeddings export block (which
+    # calls analyzer.generate_structural_stylometric_embeddings()) has
+    # to live AFTER this assignment, never before it in the function
+    # body, or Python raises UnboundLocalError at call time.
     logging.info("Step 3: Generating dual-track embeddings + Gated Multimodal Fusion...")
     analyzer = CohortAnalyzer(
         cohort_data=cohort_graphs,
         node_vocab_size=len(loader.node_vocab),
         edge_vocab_size=len(loader.edge_vocab),
-        source_dir=args.src, # Pass the entire list of roots directly
+        source_dir=args.src,  # Pass the entire list of roots directly
         workspace_dir=workspace_dir,
     )
     analyzer.generate_all_embeddings()
@@ -231,16 +258,54 @@ def main():
     if args.export_embeddings:
         import numpy as np
 
+        if not args.no_structural_stylo:
+            logging.info("Step 3b: Generating graph2vec + TF-IDF stylometric embeddings...")
+            try:
+                analyzer.generate_structural_stylometric_embeddings()
+            except ImportError as e:
+                logging.warning(
+                    f"[EXPORT] Skipping structural/stylometric embeddings — "
+                    f"missing dependency ({e}). v_topo/v_text/v_program will "
+                    f"still be exported. Install karateclub to enable this."
+                )
+            except Exception as e:
+                logging.error(
+                    f"[EXPORT] generate_structural_stylometric_embeddings() failed "
+                    f"({e}) — continuing with v_topo/v_text/v_program only."
+                )
+
         student_ids = analyzer.student_ids
         export_payload = {"student_ids": np.array(student_ids, dtype=object)}
         for space, attr in (
             ("v_topo", "vectors_topo"),
             ("v_text", "vectors_text"),
             ("v_program", "vectors_program"),
+            ("v_g2v", "vectors_g2v"),
+            ("v_stylo", "vectors_stylo"),
         ):
             vec_dict = getattr(analyzer, attr, None)
-            if vec_dict:
-                export_payload[space] = np.stack([vec_dict[sid] for sid in student_ids])
+            if not vec_dict:
+                continue
+
+            # v_g2v / v_stylo can legitimately cover fewer submissions
+            # than student_ids (empty CPGs, empty stripped source) —
+            # unlike v_topo/v_text/v_program, which every submission
+            # gets by construction. Only emit a companion "<space>_ids"
+            # array when coverage is partial, so hdbscan_cluster.py's
+            # loader (which falls back to "student_ids" when no
+            # "<space>_ids" key exists) keeps working unchanged for the
+            # always-complete spaces.
+            ids_present = [sid for sid in student_ids if sid in vec_dict]
+            if len(ids_present) < len(student_ids):
+                logging.warning(
+                    f"[EXPORT] '{space}' only covers {len(ids_present)}/"
+                    f"{len(student_ids)} submissions — see prior warnings "
+                    f"for which ones were dropped and why"
+                )
+                export_payload[f"{space}_ids"] = np.array(ids_present, dtype=object)
+
+            if ids_present:
+                export_payload[space] = np.stack([vec_dict[sid] for sid in ids_present])
 
         np.savez_compressed(args.export_embeddings, **export_payload)
         logging.info(
@@ -258,6 +323,10 @@ def main():
         gap_size=args.gap_size,
         neighbor_length=args.neighbor_length,
         cluster_skip=args.cluster_skip,
+        cluster_method=args.cluster_method,
+        hdbscan_structural_weight=args.hdbscan_structural_weight,
+        hdbscan_stylometric_weight=args.hdbscan_stylometric_weight,
+        hdbscan_min_cluster_size=args.hdbscan_min_cluster_size,
     )
 
     # ── Step 5: Compute suspicion scores ──────────────────────────────
