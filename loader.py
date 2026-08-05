@@ -207,10 +207,12 @@ class CPGDataLoader:
         candidate_keys = ["labelV", "label", "_label", "type", "nodeType"]
         graphml_files = []
 
-        for root, _, files in os.walk(self.input_dir):
+        for root, dirs, files in os.walk(self.input_dir):
+            dirs.sort()  # deterministic traversal order (os.walk order is
+            # filesystem-dependent otherwise, not guaranteed stable run to run)
             if any(x in root for x in ("_stripped", "_comments", "skeleton")):
                 continue
-            for f in files:
+            for f in sorted(files):
                 if f.endswith(".graphml"):
                     graphml_files.append(os.path.join(root, f))
 
@@ -271,10 +273,11 @@ class CPGDataLoader:
 
         files = []
         base_abs = os.path.abspath(self.input_dir)
-        for root, _, filenames in os.walk(base_abs):
+        for root, dirs, filenames in os.walk(base_abs):
+            dirs.sort()  # deterministic traversal order
             if any(x in root for x in ("_stripped", "_comments", "skeleton")):
                 continue
-            for f in filenames:
+            for f in sorted(filenames):
                 if f.endswith(".graphml"):
                     files.append(os.path.join(root, f))
 
@@ -289,18 +292,36 @@ class CPGDataLoader:
             tasks.append((f, self.node_vocab, self.edge_vocab, bypass_slicing,
                           self.active_label_key, self._skeleton_hashes, student_id))
 
+        # NOTE: as_completed() yields futures in worker-finish order, which
+        # varies run to run (file parse time depends on graph size — see
+        # the "[GST] slow pair ... took 6.8s" style logs showing large
+        # variance in |A|/|B|). That's not just cosmetic: student_ids =
+        # list(cohort_pyg.keys()) downstream feeds GraphEncoder.fit_corpus's
+        # sequential Doc2Vec/graph2vec training and the VGAE's batch
+        # construction — the ORDER graphs are seen in during training
+        # changes the learned embedding, even with workers=1 and a fixed
+        # seed (workers=1 only fixes float-summation order WITHIN a given
+        # training sequence, not the sequence itself). So results are
+        # collected here in whatever order finishes, then the final dict
+        # is rebuilt in sorted student_id order below — deterministic
+        # regardless of which worker happens to finish first.
+        results = {}
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_load_and_slice_single_file, task): task for task in tasks}
             for future in as_completed(futures):
                 student_id, payload = future.result()
                 if payload:
-                    x_tensor = torch.tensor(payload["x"], dtype=torch.long)
-                    edge_index = torch.tensor(payload["edge_index"], dtype=torch.long).t().contiguous()
-                    edge_attr = torch.tensor(payload["edge_attr"], dtype=torch.long)
+                    results[student_id] = payload
 
-                    cohort_data[student_id] = CPGGraph(
-                        x=x_tensor, edge_index=edge_index, edge_attr=edge_attr,
-                    )
+        for student_id in sorted(results.keys()):
+            payload = results[student_id]
+            x_tensor = torch.tensor(payload["x"], dtype=torch.long)
+            edge_index = torch.tensor(payload["edge_index"], dtype=torch.long).t().contiguous()
+            edge_attr = torch.tensor(payload["edge_attr"], dtype=torch.long)
+
+            cohort_data[student_id] = CPGGraph(
+                x=x_tensor, edge_index=edge_index, edge_attr=edge_attr,
+            )
 
         return cohort_data
 

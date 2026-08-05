@@ -1,5 +1,8 @@
+--find-links https://data.pyg.org/whl/torch-2.4.0+cpu.html
+
 numpy
-torch
+torch==2.4.0
+torch_geometric
 pandas>=2.0
 gensim
 karateclub
