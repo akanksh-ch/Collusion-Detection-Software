@@ -1,4 +1,4 @@
-"""Dual-track submission encoder: graph2vec (topological) + TF-IDF/SVD (lexical),
+"""Dual-track submission encoder: VGAE (topological) + TF-IDF/SVD (lexical),
 fused via L2-normalise + concatenate.
 """
 
@@ -6,103 +6,249 @@ from __future__ import annotations
 
 import logging
 
-import networkx as nx
 import numpy as np
 import torch
 import torch.nn as nn
-from karateclub import Graph2Vec
+import torch.nn.functional as F
+from torch_geometric.nn import GINEConv, global_mean_pool
+from torch_geometric.data import Data, Batch
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 1. Topological Track — graph2vec (karateclub)
+# 1. Topological Track — Graph VAE, trained fresh per cohort
 # ══════════════════════════════════════════════════════════════════════
 
-class GraphEncoder:
-    """Wraps karateclub's Graph2Vec so it plugs into the existing
-    encode_submission / MultiModalEncoder call sites.
+class _GAEEncoderModule(nn.Module):
+    """Trainable 2-layer residual GINEConv encoder with VGAE mean/logvar
+    heads. Same node feature scheme the earlier frozen GraphEncoder used
+    (twin type/style embeddings + log1p degree features) — the difference
+    is every weight here gets gradient updates via edge-reconstruction loss
+    instead of sitting at a frozen random init.
 
-    Graph2Vec needs the full cohort up front (fit_corpus), then returns
-    per-graph embeddings either from the fitted model (in-sample) or
-    via .infer() for graphs seen after fitting (out-of-sample).
+    Note: this call site (MultiModalEncoder.encode_submission) doesn't
+    currently thread edge_attr through, so edges are treated as untyped
+    (a constant zero edge feature) — effectively plain GIN rather than
+    GINE. If real edge types become available here later, wire edge_attr
+    through encode_submission's pyg_data and this'll pick them up for free
+    via the existing edge_embedding table.
     """
 
     def __init__(
         self,
-        node_type_vocab_size: int = 0,
+        style_vocab_size: int = 5,
+        edge_vocab_size: int = 10,
+        node_type_vocab_size: int = 256,
+        type_embed_dim: int = 48,
+        style_embed_dim: int = 16,
+        hidden_dim: int = 128,
+        output_dim: int = 128,
+    ):
+        super().__init__()
+        cat_dim = type_embed_dim + style_embed_dim
+        node_feat_dim = cat_dim + 2  # + log1p(in-deg), log1p(out-deg)
+
+        self.type_embedding = nn.Embedding(node_type_vocab_size + 2, type_embed_dim)
+        self.style_embedding = nn.Embedding(style_vocab_size + 2, style_embed_dim)
+        self.edge_embedding = nn.Embedding(edge_vocab_size + 2, cat_dim)
+
+        self.input_proj = nn.Linear(node_feat_dim, hidden_dim)
+
+        gin_mlp1 = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim))
+        gin_mlp2 = nn.Sequential(nn.Linear(hidden_dim, output_dim), nn.ReLU(), nn.Linear(output_dim, output_dim))
+        self.conv1 = GINEConv(gin_mlp1, edge_dim=cat_dim)
+        self.conv2 = GINEConv(gin_mlp2, edge_dim=cat_dim)
+
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.ln2 = nn.LayerNorm(output_dim)
+        self.residual_proj = nn.Linear(hidden_dim, output_dim)
+        self.relu = nn.ReLU()
+
+        self.mu_head = nn.Linear(output_dim, output_dim)
+        self.logvar_head = nn.Linear(output_dim, output_dim)
+
+    @staticmethod
+    def _degree_features(num_nodes: int, edge_index: torch.Tensor) -> torch.Tensor:
+        device = edge_index.device
+        out_deg = torch.zeros(num_nodes, device=device)
+        in_deg = torch.zeros(num_nodes, device=device)
+        if edge_index.numel() > 0:
+            src, dst = edge_index[0], edge_index[1]
+            out_deg.scatter_add_(0, src, torch.ones_like(src, dtype=torch.float32))
+            in_deg.scatter_add_(0, dst, torch.ones_like(dst, dtype=torch.float32))
+        return torch.stack([torch.log1p(in_deg), torch.log1p(out_deg)], dim=-1)
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor | None = None):
+        x_type = x[:, 0].long().clamp(max=self.type_embedding.num_embeddings - 1)
+        x_style = x[:, 1].long().clamp(max=self.style_embedding.num_embeddings - 1)
+        h_type = self.type_embedding(x_type)
+        h_style = self.style_embedding(x_style)
+        degree_feat = self._degree_features(x.size(0), edge_index)
+        h_cat = torch.cat([h_type, h_style, degree_feat], dim=-1)
+
+        if edge_attr is not None and edge_index.size(1) > 0:
+            edge_feat = self.edge_embedding(edge_attr.long())
+        else:
+            edge_feat = torch.zeros(
+                (edge_index.size(1), self.edge_embedding.embedding_dim), device=h_cat.device
+            )
+
+        h = self.relu(self.input_proj(h_cat))
+        h_res = h
+        h = self.relu(self.ln1(self.conv1(h, edge_index, edge_attr=edge_feat) + h_res))
+        h_res = self.residual_proj(h)
+        h = self.relu(self.ln2(self.conv2(h, edge_index, edge_attr=edge_feat) + h_res))
+
+        mu = self.mu_head(h)
+        logvar = self.logvar_head(h)
+        return mu, logvar
+
+    @staticmethod
+    def pool(node_vecs: torch.Tensor, batch: torch.Tensor | None = None) -> torch.Tensor:
+        if batch is None:
+            batch = torch.zeros(node_vecs.size(0), dtype=torch.long, device=node_vecs.device)
+        return global_mean_pool(node_vecs, batch)
+
+
+def _reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    std = torch.exp(0.5 * logvar)
+    eps = torch.randn_like(std)
+    return mu + eps * std
+
+
+def _recon_loss(z: torch.Tensor, edge_index: torch.Tensor, num_nodes: int, generator: torch.Generator) -> torch.Tensor:
+    """Inner-product decoder edge reconstruction loss (Kipf & Welling, 2016)."""
+    src, dst = edge_index[0], edge_index[1]
+    pos_logits = (z[src] * z[dst]).sum(dim=-1)
+    pos_loss = F.binary_cross_entropy_with_logits(pos_logits, torch.ones_like(pos_logits))
+
+    num_neg = max(edge_index.size(1), 1)
+    neg_src = torch.randint(0, num_nodes, (num_neg,), generator=generator)
+    neg_dst = torch.randint(0, num_nodes, (num_neg,), generator=generator)
+    neg_logits = (z[neg_src] * z[neg_dst]).sum(dim=-1)
+    neg_loss = F.binary_cross_entropy_with_logits(neg_logits, torch.zeros_like(neg_logits))
+
+    return pos_loss + neg_loss
+
+
+def _kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    return -0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
+
+
+class GraphEncoder:
+    """VGAE-based topological encoder — same call-site shape the earlier
+    Graph2Vec wrapper had (fit_corpus(...) then __call__(x, edge_index, ...)
+    -> [1, dim] tensor), so MultiModalEncoder doesn't need to change.
+
+    Trains from scratch on the cohort's own graphs every time fit_corpus()
+    is called (unsupervised, edge-reconstruction + KL loss) — no checkpoint
+    is ever saved or loaded, so there's no staleness concern, matching
+    Graph2Vec's "retrain from this corpus every run" model. Unlike
+    Graph2Vec, the encoder is now actually trained rather than a fixed
+    hash, which is what gives it a real "structurally similar graph ->
+    nearby embedding" property.
+
+    In-sample graphs (seen during fit_corpus) return the cached embedding
+    computed in that training pass; out-of-sample graphs get a fresh
+    forward pass through the now-trained (eval-mode) encoder.
+    """
+
+    def __init__(
+        self,
+        node_type_vocab_size: int = 256,
         style_vocab_size: int = 5,
         edge_vocab_size: int = 10,
         output_dim: int = 128,
-        wl_iterations: int = 3,
-        epochs: int = 100,
-        min_count: int = 1,
+        epochs: int = 200,
+        lr: float = 1e-3,
+        kl_weight: float = 1e-3,
         seed: int = 90,
     ):
-        # node_type_vocab_size / style_vocab_size / edge_vocab_size kept
-        # for call-site compatibility, unused (Graph2Vec hashes node
-        # features directly, no fixed vocab table needed).
         self.output_dim = output_dim
-        self._model = Graph2Vec(
-            wl_iterations=wl_iterations,
-            attributed=True,
-            dimensions=output_dim,
-            epochs=epochs,
-            min_count=min_count,
-            seed=seed,
-            # gensim's Doc2Vec training underneath Graph2Vec is only
-            # deterministic (given a fixed seed) with workers=1 — multi-
-            # threaded accumulation order changes float summation order.
-            # NOTE: this alone is NOT sufficient for full reproducibility;
-            # gensim's vocab hashing also depends on Python's per-process
-            # str hash(), which needs PYTHONHASHSEED pinned (see Dockerfile).
-            workers=1,
+        self.epochs = epochs
+        self.lr = lr
+        self.kl_weight = kl_weight
+        self.seed = seed
+
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        self._gen = torch.Generator().manual_seed(seed)
+
+        self._model = _GAEEncoderModule(
+            node_type_vocab_size=node_type_vocab_size,
+            style_vocab_size=style_vocab_size,
+            edge_vocab_size=edge_vocab_size,
+            output_dim=output_dim,
         )
+
         self._fitted = False
-        # graph identity -> index into the fitted corpus, so re-encoding
-        # a cohort graph returns its trained vector instead of re-inferring.
         self._index_by_key: dict[int, int] = {}
         self._trained_vectors: np.ndarray | None = None
+        self.loss_history: list[dict[str, float]] = []
 
     def eval(self):
+        self._model.eval()
         return self
 
     def parameters(self):
-        return iter(())
-
-    @staticmethod
-    def _to_networkx(x: np.ndarray, edge_index: np.ndarray) -> nx.Graph:
-        """Build an undirected nx.Graph with a string "feature" attribute
-        per node (Graph2Vec's attributed mode expects this key)."""
-        g = nx.Graph()
-        for i, (node_type, style) in enumerate(x):
-            g.add_node(i, feature=f"{int(node_type)}_{int(style)}")
-        if edge_index.size:
-            for s, d in zip(edge_index[0], edge_index[1]):
-                g.add_edge(int(s), int(d))
-        return g
+        return self._model.parameters()
 
     @staticmethod
     def _graph_key(x: np.ndarray, edge_index: np.ndarray) -> int:
         return hash((x.tobytes(), edge_index.tobytes()))
 
     def fit_corpus(self, graphs: list[dict]) -> None:
-        """Fit Graph2Vec once over the whole cohort.
+        """Train the VGAE from scratch over the whole cohort.
 
         Args:
             graphs: list of {"x": ndarray[N,2], "edge_index": ndarray[2,E]}
         """
-        nx_graphs = []
         keys = []
+        data_list = []
         for g in graphs:
             x_np = _to_numpy(g["x"]).astype(np.int64)
             edge_index_np = _to_numpy(g["edge_index"]).astype(np.int64)
-            nx_graphs.append(self._to_networkx(x_np, edge_index_np))
             keys.append(self._graph_key(x_np, edge_index_np))
+            edge_index_t = torch.from_numpy(edge_index_np).long()
+            if edge_index_t.numel() == 0:
+                edge_index_t = edge_index_t.reshape(2, 0)
+            data_list.append(Data(x=torch.from_numpy(x_np).long(), edge_index=edge_index_t))
 
-        logging.info(f"[graph2vec] fitting Graph2Vec over {len(nx_graphs)} graphs")
-        self._model.fit(nx_graphs)
-        self._trained_vectors = self._model.get_embedding()
+        logging.info(f"[VGAE] fitting over {len(data_list)} graphs")
+        batch = Batch.from_data_list(data_list)
+
+        self._model.train()
+        optimizer = torch.optim.Adam(self._model.parameters(), lr=self.lr)
+
+        for epoch in range(self.epochs):
+            optimizer.zero_grad()
+            mu, logvar = self._model(batch.x, batch.edge_index)
+            z = _reparameterize(mu, logvar)
+
+            r_loss = _recon_loss(z, batch.edge_index, z.size(0), self._gen)
+            k_loss = _kl_loss(mu, logvar)
+            loss = r_loss + self.kl_weight * k_loss
+
+            loss.backward()
+            optimizer.step()
+
+            if epoch % 50 == 0 or epoch == self.epochs - 1:
+                self.loss_history.append(
+                    {"epoch": epoch, "recon": r_loss.item(), "kl": k_loss.item(), "total": loss.item()}
+                )
+                logging.info(
+                    f"[VGAE] epoch {epoch}/{self.epochs} "
+                    f"recon={r_loss.item():.4f} kl={k_loss.item():.4f} total={loss.item():.4f}"
+                )
+
+        self._model.eval()
+        with torch.no_grad():
+            mu, _ = self._model(batch.x, batch.edge_index)
+            pooled = self._model.pool(mu, batch.batch)
+            pooled = F.normalize(pooled, p=2, dim=-1).cpu().numpy()
+
+        self._trained_vectors = pooled
         self._index_by_key = {k: i for i, k in enumerate(keys)}
         self._fitted = True
 
@@ -118,11 +264,18 @@ class GraphEncoder:
         if idx is not None:
             vec = self._trained_vectors[idx]
         else:
-            g = self._to_networkx(x_np, edge_index_np)
-            vec = self._model.infer([g])[0]
+            # Out-of-sample graph: forward pass through the now-trained,
+            # eval-mode encoder (deterministic — mu, not a sampled z).
+            edge_index_t = torch.from_numpy(edge_index_np).long()
+            if edge_index_t.numel() == 0:
+                edge_index_t = edge_index_t.reshape(2, 0)
+            with torch.no_grad():
+                mu, _ = self._model(torch.from_numpy(x_np).long(), edge_index_t)
+                pooled = self._model.pool(mu)
+                vec = F.normalize(pooled, p=2, dim=-1).squeeze(0).cpu().numpy()
 
         if debug:
-            print(f"[graph2vec] nodes={x_np.shape[0]} edges={edge_index_np.shape[1]} "
+            print(f"[VGAE] nodes={x_np.shape[0]} edges={edge_index_np.shape[1]} "
                   f"in_sample={idx is not None} norm={np.linalg.norm(vec):.4f}")
 
         return torch.from_numpy(np.asarray(vec, dtype=np.float32)).unsqueeze(0)
@@ -247,8 +400,9 @@ class MultiModalEncoder:
         dim: int = 128,
         style_vocab_size: int = 5,
         seed: int = 90,
-        graph2vec_epochs: int = 100,
-        graph2vec_wl_iterations: int = 3,
+        vgae_epochs: int = 200,
+        vgae_lr: float = 1e-3,
+        vgae_kl_weight: float = 1e-3,
     ):
         self.dim = dim
         self.seed = seed
@@ -258,8 +412,9 @@ class MultiModalEncoder:
             style_vocab_size=style_vocab_size,
             edge_vocab_size=edge_vocab_size,
             output_dim=dim,
-            wl_iterations=graph2vec_wl_iterations,
-            epochs=graph2vec_epochs,
+            epochs=vgae_epochs,
+            lr=vgae_lr,
+            kl_weight=vgae_kl_weight,
             seed=seed,
         )
         self.graph_encoder.eval()
@@ -281,7 +436,7 @@ class MultiModalEncoder:
     def fit_cohort(self, cohort_pyg: dict, stripped_texts: list[str], comment_texts: list[str]):
         student_ids = list(cohort_pyg.keys())
 
-        # Fit graph2vec over the whole cohort first — everything else
+        # Train the VGAE over the whole cohort first — everything else
         # (text SVD, ABTT calibration) depends on encode_submission,
         # which needs a fitted graph encoder.
         graphs_for_fit = [
