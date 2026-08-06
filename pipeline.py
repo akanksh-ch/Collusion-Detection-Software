@@ -38,3 +38,10 @@ for future in as_completed(futures):
 
 def run_pipeline():
     print("Hello from pipeline")
+
+    # generate_graph_embeddings(cache_dir)
+    # generate_tfidfvectors(cache_dir)
+    # generate_gst_coverage(cache_dir?)
+
+    # snfpy(graph, tfidf, gst)
+    # leiden(snfpy)
