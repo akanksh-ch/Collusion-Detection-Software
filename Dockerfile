@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 # Grab Joern binaries
 
 FROM ghcr.io/joernio/joern:nightly AS joern-source
@@ -7,6 +9,14 @@ COPY --from=joern-source /opt/joern /opt/joern
 
 # Add to path so it's accessible through CLI.
 ENV PATH="/opt/joern/joern-cli:${PATH}"
+
+RUN <<EOF
+if command -v joern-parse &> /dev/null; then
+    echo "Available"
+else
+    echo "Not available"
+fi
+EOF
 
 # Main image running the project
 
