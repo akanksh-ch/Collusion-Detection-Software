@@ -6,7 +6,7 @@ from platformdirs import user_cache_dir # Storing CPGs and temp stuff in userdir
 from concurrent.futures import ThreadPoolExecutor
 import subprocess
 
-from graph import generate_graph
+import graph
 
 CACHE_DIR = user_cache_dir('cds', ensure_exists=True)
 
