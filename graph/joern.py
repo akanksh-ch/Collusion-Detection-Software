@@ -3,20 +3,20 @@ This file contains code to generate CPGs using Joern
 """
 
 import subprocess
-from 
+from sys import stdout
 
 # joern-parse -J-Xmx2048M student01-non-plagiarized.java -o cpg.bin
 # joern-export -J-Xmx2048M --repr cpg cpg.bin -o test
 
 def generate_cpg(path: str):
     parse_result = subprocess.run(
-            ['joern-parse', '-J-Xmx2048M', path, '-o', f"{path}.bin"],
-        stderr=subprocess.STDOUT
+        ['joern-parse', '-J-Xmx2048M', path, '-o', f"{path}.bin"],
+        stderr=stdout,
         text=True  # Returns strings instead of bytes
     )
 
     export_result = subprocess.run(
-            ['joern-export', '-J-Xmx2048M', '--repr', 'cpg', f"{path}.bin", '-o', f"{path}_export"]
-        stderr=subprocess.STDOUT
+        ['joern-export', '-J-Xmx2048M', '--repr', 'cpg', f"{path}.bin", '-o', f"{path}_export"],
+        stderr=stdout,
         text=True  # Returns strings instead of bytes
     )
