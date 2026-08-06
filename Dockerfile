@@ -8,10 +8,10 @@ FROM ghcr.io/joernio/joern:nightly AS joern-source
 ENV PATH="/opt/joern/joern-cli:${PATH}"
 
 RUN <<EOF
-if command -v joern-parse &> /dev/null; then
-    echo "Available"
+if command -v joern-parse joern-export &> /dev/null; then
+    echo "Binaries found"
 else
-    echo "Not available"
+    echo "Missing binaries: please check environment"
 fi
 EOF
 
