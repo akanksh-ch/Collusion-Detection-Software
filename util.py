@@ -1,4 +1,7 @@
 import subprocess
+from pathlib import Path
+from os import access as perm
+from os import R_OK
 
 def get_ram():
     # Get ram info (joern is ram-heavy)
@@ -15,3 +18,13 @@ def get_ram():
 def get_cpu():
     # Cpu (core) count
     return int(subprocess.check_output(["nproc", "--all"]).decode().strip()) - 1 # C'mon man poor CPU
+
+def validate_path():
+   # Checking if path is valid
+    if not Path(path).exists():
+        raise FileNotFoundError(f"File or Directory not found: {str(Path(path).resolve())}")
+
+    # Checking if it's readable
+    if not perm(Path(path), R_OK):
+        raise PermissionError(f"Could not read: {str(Path(path).resolve())}")
+
