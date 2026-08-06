@@ -4,9 +4,6 @@
 
 FROM ghcr.io/joernio/joern:nightly AS joern-source
 
-# Copy neccessary binaries
-COPY --from=joern-source /opt/joern /opt/joern
-
 # Add to path so it's accessible through CLI.
 ENV PATH="/opt/joern/joern-cli:${PATH}"
 
@@ -21,6 +18,9 @@ EOF
 # Main image running the project
 
 FROM python:3.12-slim
+
+# Copy neccessary binaries
+COPY --from=joern-source /opt/joern /opt/joern
 
 WORKDIR /app
 
