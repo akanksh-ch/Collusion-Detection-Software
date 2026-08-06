@@ -27,6 +27,14 @@ WORKDIR /app
 # Install uv package manager
 COPY --from=ghcr.io/astral-sh/uv:0.12.2 /uv /uvx /bin/
 
+# Snippet from docs: https://docs.astral.sh/uv/guides/integration/docker/#installing-a-package
+
+RUN uv venv /opt/venv
+# Use the virtual environment automatically
+ENV VIRTUAL_ENV=/opt/venv
+# Place entry points in the environment at the front of the path
+ENV PATH="/opt/venv/bin:$PATH"
+
 # Install dependencies
 COPY requirements.txt .
 
