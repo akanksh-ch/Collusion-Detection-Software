@@ -1,0 +1,5 @@
+karateclub
+networkx
+snfpy
+python-igraph
+tqdm
