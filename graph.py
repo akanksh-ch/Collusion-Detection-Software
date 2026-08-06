@@ -34,8 +34,5 @@ def generate_graph(path: str): # file or directory
             ram_avail = ram_avail / 1024 # Returns in mb which can be used such as -Xmx5120M
 
     # Cpu (core) count
-            
 
-
-
-    
+    core_count = int(subprocess.check_output(["nproc", "--all"]).decode().strip()) - 1 # C'mon man poor CPU 
