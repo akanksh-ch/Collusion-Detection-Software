@@ -38,7 +38,8 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Install dependencies
 COPY requirements.txt .
 
-RUN uv pip install -r requirements.txt
+# Karateclub (Graph2Vec) has older pandas and numpy versions, we're overriding them
+RUN uv pip install --system -r requirements.txt --override requirements.txt
 
 # Python changes seed per process, setting env variable to prevent this. Refer (PEP 456)
 ENV PYTHONHASHSEED=0
