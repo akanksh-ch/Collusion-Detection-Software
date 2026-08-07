@@ -5,18 +5,18 @@ This file contains code to generate CPGs using Joern
 import subprocess
 from sys import stdout
 
-# joern-parse -J-Xmx2048M student01-non-plagiarized.java -o cpg.bin
-# joern-export -J-Xmx2048M --repr cpg cpg.bin -o test
-
-def generate_cpg(path: str):
+def generate_cpg(path: str, ram_mb: int):
+    # Pass the calculated RAM down to the JVM, with a hard minimum of 128MB just in case
+    ram_flag = f'-J-Xmx{max(128, ram_mb)}M' 
+    
     parse_result = subprocess.run(
-        ['joern-parse', '-J-Xmx2048M', path, '-o', f"{path}.bin"],
+        ['joern-parse', ram_flag, path, '-o', f"{path}.bin"],
         stderr=stdout,
-        text=True  # Returns strings instead of bytes
+        text=True
     )
 
     export_result = subprocess.run(
-        ['joern-export', '-J-Xmx2048M', '--repr', 'cpg', f"{path}.bin", '-o', f"{path}_export"],
+        ['joern-export', ram_flag, '--repr', 'cpg', f"{path}.bin", '-o', f"{path}_export"],
         stderr=stdout,
-        text=True  # Returns strings instead of bytes
+        text=True
     )
