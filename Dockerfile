@@ -19,6 +19,13 @@ EOF
 
 FROM python:3.12-slim
 
+# Install curl and general dependencies
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy neccessary binaries
 COPY --from=joern-source /opt/joern /opt/joern
 
@@ -39,6 +46,6 @@ RUN uv pip install --system -r requirements.txt --override requirements.txt
 # Python changes seed per process, setting env variable to prevent this. Refer (PEP 456)
 ENV PYTHONHASHSEED=0
 
-COPY *.py .
+COPY . .
 
 CMD ["python", "main.py"]
