@@ -2,10 +2,7 @@
 
 # Grab Joern binaries
 
-FROM ghcr.io/joernio/joern:nightly AS joern-source
-
-# Add to path so it's accessible through CLI.
-ENV PATH="/opt/joern/joern-cli:${PATH}"
+FROM ghcr.io/joernio/joern:master AS joern-source
 
 RUN <<EOF
 if command -v joern-parse joern-export &> /dev/null; then
@@ -45,6 +42,9 @@ RUN uv pip install --system -r requirements.txt --override requirements.txt
 
 # Python changes seed per process, setting env variable to prevent this. Refer (PEP 456)
 ENV PYTHONHASHSEED=0
+
+# Add to path so it's accessible through CLI.
+ENV PATH="/opt/joern/joern-cli:${PATH}"
 
 COPY . .
 
