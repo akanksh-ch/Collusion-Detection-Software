@@ -8,10 +8,10 @@ def get_ram():
     ram_avail = 0
 
     with open('/proc/meminfo', 'r') as meminfo:
-    for line in meminfo:
-        if line.startswith('MemAvailable:'):
-            ram_avail = int(line.split()[1]) # Returns in kB
-            ram_avail = ram_avail / 1024 # Returns in mb which can be used such as -Xmx5120M
+        for line in meminfo:
+            if line.startswith('MemAvailable:'):
+                ram_avail = int(line.split()[1]) # Returns in kB
+                ram_avail = ram_avail / 1024 # Returns in mb which can be used such as -Xmx5120M
 
     return ram_avail
 
