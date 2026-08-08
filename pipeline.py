@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import util
 import graph
 import lexical
-import gst
+import strmatch
 import fusion
 import leiden
 
@@ -85,7 +85,7 @@ def run_pipeline(root_dirs: list[str]):
 
     # gst: compute the pairwise Greedy String Tiling coverage matrix, the strongest single signal
     logger.info("Computing GST coverage...")
-    gst_coverage = gst.compute_gst_coverage(submission_paths)
+    gst_coverage = strmatch.compute_gst_coverage(submission_paths)
     np.save(CACHE_DIR / "gst_coverage.npy", gst_coverage)
 
     # fusion: combine the topological, lexical, and GST similarity networks into one fused matrix via SNF
