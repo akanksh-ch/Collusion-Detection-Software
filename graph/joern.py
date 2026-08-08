@@ -5,7 +5,7 @@ This file contains code to generate CPGs using Joern
 import subprocess
 from sys import stdout
 
-def generate_cpg(path: str, ram_mb: int):
+def generate_cpg(path: str, ram_mb=128):
     # Pass the calculated RAM down to the JVM, with a hard minimum of 128MB just in case
     ram_flag = f'-J-Xmx{max(128, ram_mb)}M' 
     
