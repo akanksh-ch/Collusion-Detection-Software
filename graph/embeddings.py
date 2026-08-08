@@ -2,6 +2,10 @@
 File which generates embeddings from Graphs
 """
 
+import networkx as nx
+import numpy as np
+from scipy.linalg import eigh
+
 def generate_embedding(
     graph: nx.Graph,
     scale_min: float = -2.0,
