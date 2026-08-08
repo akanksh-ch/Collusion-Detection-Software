@@ -7,7 +7,7 @@ def get_ram():
     # Get ram info (joern is ram-heavy)
     ram_avail = 0
 
-    with open('/proc/meminfo', 'read') as meminfo:
+    with open('/proc/meminfo', 'r') as meminfo:
     for line in meminfo:
         if line.startswith('MemAvailable:'):
             ram_avail = int(line.split()[1]) # Returns in kB
