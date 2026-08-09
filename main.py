@@ -22,7 +22,7 @@ def main(root_dirs: list[str], dataset: str, output: str | None) -> dict:
     if dataset == 'criminalminds':
         ground_truth = generate_labels_criminalminds(root_dirs)
     else:
-        ground_truth = generate_labels_irplag(root_dirs[0])
+        ground_truth = generate_labels_irplag(root_dirs)
 
     # loading: reload the ordered submission paths and fused similarity matrix that run_pipeline just wrote to CACHE_DIR
     import numpy as np
