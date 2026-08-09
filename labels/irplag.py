@@ -12,11 +12,11 @@ NON_PLAGIARIZED_PATTERN = re.compile(r'^student\d+-non-plagiarized\.java$')
 BASELINE_NAME = 'original-baseline.java'
 
 
-def generate_labels(root_dir: str) -> dict[str, int]:
-    # scanning: walk each case-NN subfolder in sorted order and collect its files as sorted, absolute paths
-    root_path = Path(root_dir)
+def generate_labels(root_dirs: list[str]) -> dict[str, int]:
+    # scanning: treat each entry in root_dirs as one case directory containing submission files
+    # directly, matching how pipeline.py scans root_dirs (one level deep, no case-NN discovery)
     case_dirs = sorted(
-        (child for child in root_path.iterdir() if child.is_dir() and child.name != ".DS_Store"),
+        (Path(root) for root in root_dirs if Path(root).is_dir() and Path(root).name != ".DS_Store"),
         key=lambda p: p.name,
     )
 
@@ -47,11 +47,11 @@ def generate_labels(root_dir: str) -> dict[str, int]:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Generate labels.json for IR-Plag submissions based on case baselines and plagiarism levels.")
-    parser.add_argument('root_dir', help="Root directory containing case-NN subfolders.")
+    parser.add_argument('root_dirs', nargs='+', help="One or more case directories, each containing that case's submission files directly.")
     parser.add_argument('--output', default='labels.json', help="Path to write the resulting labels.json (default: labels.json).")
     args = parser.parse_args()
 
-    labels = generate_labels(args.root_dir)
+    labels = generate_labels(args.root_dirs)
 
     with open(args.output, 'w') as f:
         json.dump(labels, f, indent=2)
