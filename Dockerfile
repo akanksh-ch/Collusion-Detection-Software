@@ -4,14 +4,6 @@
 
 FROM ghcr.io/joernio/joern:master AS joern-source
 
-RUN <<EOF
-if command -v joern-parse joern-export &> /dev/null; then
-    echo "Binaries found"
-else
-    echo "Missing binaries: please check environment"
-fi
-EOF
-
 # Main image running the project
 
 FROM python:3.12-slim
@@ -20,7 +12,8 @@ FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
-    build-essential \
+	default-jre-headless \
+	build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy neccessary binaries
