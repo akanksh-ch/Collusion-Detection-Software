@@ -9,5 +9,6 @@ python-igraph>=0.11
 leidenalg>=0.10
 gensim>=4.3
 tqdm>=4.66
+hdbscan>=0.8.40,<0.9
 platformdirs
 https://github.com/apluslms/greedy-string-tiling/archive/master.zip

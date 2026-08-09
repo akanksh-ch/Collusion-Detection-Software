@@ -1,5 +1,5 @@
 """
-Orchestrates the full collusion detection pipeline end-to-end: scans submissions, computes graph/lexical/GST signals, fuses them with SNF, and clusters the result with Leiden.
+Orchestrates the full collusion detection pipeline end-to-end: scans submissions, computes graph/lexical/GST signals, fuses them with SNF, and clusters the result with HDBSCAN (primary) and Leiden/CPM (comparison).
 """
 
 import json
@@ -15,6 +15,7 @@ import lexical
 import strmatch
 import fusion
 import leiden
+import hdbscan_cluster
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -105,20 +106,30 @@ def run_pipeline(root_dirs: list[str]):
     fused_matrix = fusion.fuse_similarity_networks([v_topo, v_lex, gst_coverage])
     np.save(CACHE_DIR / "S_fused.npy", fused_matrix)
 
-    # clustering: run Leiden community detection on the fused network to produce the final collusion groups
-    logger.info("Clustering fused network...")
-    clusters = leiden.run_leiden(fused_matrix, submission_paths)
-    output_path = CACHE_DIR / "clusters.json"
-    with open(output_path, "w") as f:
-        json.dump(clusters, f, indent=4)
-    logger.info(f"Pipeline complete! Raw clusters saved to {output_path}")
+    # clustering: run HDBSCAN as the primary clustering method, since its density adapts locally across the
+    # graph and it can leave non-colluding submissions unlabeled instead of forcing them into a cluster
+    logger.info("Clustering fused network with HDBSCAN...")
+    hdbscan_clusters = hdbscan_cluster.run_hdbscan(fused_matrix, submission_paths)
+    hdbscan_output_path = CACHE_DIR / "clusters_hdbscan.json"
+    with open(hdbscan_output_path, "w") as f:
+        json.dump(hdbscan_clusters, f, indent=4)
 
-    return clusters
+    # comparison: also run Leiden/CPM as a comparison point against HDBSCAN, per the dissertation's cluster quality benchmarking
+    logger.info("Clustering fused network with Leiden/CPM...")
+    leiden_clusters = leiden.run_leiden(fused_matrix, submission_paths)
+    leiden_output_path = CACHE_DIR / "clusters_leiden.json"
+    with open(leiden_output_path, "w") as f:
+        json.dump(leiden_clusters, f, indent=4)
+
+    logger.info(f"Pipeline complete! HDBSCAN clusters saved to {hdbscan_output_path}")
+    logger.info(f"Pipeline complete! Leiden/CPM clusters saved to {leiden_output_path}")
+
+    return hdbscan_clusters, leiden_clusters
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Run the full SNF + Leiden pipeline across multiple roots")
+    parser = argparse.ArgumentParser(description="Run the full SNF + HDBSCAN/Leiden pipeline across multiple roots")
     parser.add_argument("root_dirs", nargs='+', help="One or more root directories containing submissions")
     args = parser.parse_args()
 
