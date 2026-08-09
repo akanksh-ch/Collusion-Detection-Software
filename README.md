@@ -13,3 +13,13 @@ graph TD
     %% Output
     E --> F[JPlag Report Viewer]
 ```
+
+### Quick runner command
+
+```bash
+docker run \
+    -v ~/Downloads/ReplicationPackage/code/:/app/submissions:ro,z \ # ,z is for SELinux purposes
+    -v ~/.cache:/root/.cache:rw,z \
+    -it cds:latest \
+    /bin/bash # Drop into shell for testing
+```
