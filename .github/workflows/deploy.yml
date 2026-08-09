@@ -57,5 +57,5 @@ jobs:
         uses: actions/attest-build-provenance@v2  # Recommended: specific action for build provenance
         with:
           subject-name: ghcr.io/${{ github.repository }}
-          subject-digest: ${{ steps.build-and-push.outputs.digest }}
+          subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
