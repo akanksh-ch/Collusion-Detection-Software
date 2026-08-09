@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path(user_cache_dir('cds', ensure_exists=True))
 
+# each signal gets its own subdirectory under CACHE_DIR, so CPG binaries/exports, lexical
+# embeddings, and GST coverage never touch submissions/ and never collide with each other
+CPG_CACHE_DIR = CACHE_DIR / "cpg"
+LEXICAL_CACHE_DIR = CACHE_DIR / "lexical"
+GST_CACHE_DIR = CACHE_DIR / "gst"
+
 
 def run_pipeline(root_dirs: list[str]):
     # hardware: size the thread pool and per-worker RAM budget safely, guarding against 0 workers or negative RAM on constrained/single-core machines
@@ -29,6 +35,9 @@ def run_pipeline(root_dirs: list[str]):
     per_worker_ram = max(128, int((total_ram - 1024) // max_workers))
     logger.info(f"Using {max_workers} threads. Allocating {per_worker_ram}MB RAM per Joern worker.")
     logger.info(f"Using cache directory: {CACHE_DIR}")
+
+    for sub_cache_dir in (CPG_CACHE_DIR, LEXICAL_CACHE_DIR, GST_CACHE_DIR):
+        sub_cache_dir.mkdir(parents=True, exist_ok=True)
 
     # scanning: walk every root dir JPlag-style and build one sorted, deterministic list of absolute submission paths shared by every downstream signal
     submission_paths = []
@@ -48,11 +57,14 @@ def run_pipeline(root_dirs: list[str]):
 
     # graph: run Joern parse -> load -> NetLSD embedding concurrently across submissions, filling failures with a zero-vector instead of silently dropping them
     def process_graph_for_submission(sub_path_str: str) -> tuple[str, np.ndarray, bool]:
-        export_dir = f"{sub_path_str}_export"
+        # give each submission its own folder under CPG_CACHE_DIR (name + path hash) so the
+        # .bin/_export artifacts never land in submissions/ and never collide across roots
+        sub_cpg_dir = CPG_CACHE_DIR / util.cache_key(sub_path_str)
+        export_dir = sub_cpg_dir / f"{Path(sub_path_str).name}_export"
         try:
-            if not Path(export_dir).exists():
-                graph.generate_cpg(sub_path_str, per_worker_ram)
-            nx_graph = graph.load_graph(export_dir)
+            if not export_dir.exists():
+                export_dir = Path(graph.generate_cpg(sub_path_str, per_worker_ram, out_dir=sub_cpg_dir))
+            nx_graph = graph.load_graph(str(export_dir))
             embedding = graph.generate_embedding(nx_graph)
             return sub_path_str, embedding, True
         except Exception as e:
@@ -76,17 +88,17 @@ def run_pipeline(root_dirs: list[str]):
         with open(CACHE_DIR / "graph_failures.json", "w") as f:
             json.dump(failed_submissions, f, indent=4)
     v_topo = np.array([graph_embeddings_dict[p] for p in submission_paths])
-    np.save(CACHE_DIR / "v_topo.npy", v_topo)
+    np.save(CPG_CACHE_DIR / "v_topo.npy", v_topo)
 
     # lexical: compute the shared-vocabulary TF-IDF char n-gram embedding matrix over the same ordered submission list
     logger.info("Computing lexical embeddings...")
     v_lex = lexical.generate_embeddings(submission_paths)
-    np.save(CACHE_DIR / "v_lex.npy", v_lex)
+    np.save(LEXICAL_CACHE_DIR / "v_lex.npy", v_lex)
 
     # gst: compute the pairwise Greedy String Tiling coverage matrix, the strongest single signal
     logger.info("Computing GST coverage...")
     gst_coverage = strmatch.compute_gst_coverage(submission_paths)
-    np.save(CACHE_DIR / "gst_coverage.npy", gst_coverage)
+    np.save(GST_CACHE_DIR / "gst_coverage.npy", gst_coverage)
 
     # fusion: combine the topological, lexical, and GST similarity networks into one fused matrix via SNF
     logger.info("Fusing similarity networks...")

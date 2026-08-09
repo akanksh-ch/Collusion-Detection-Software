@@ -1,3 +1,4 @@
+import hashlib
 import subprocess
 from pathlib import Path
 from os import access as perm
@@ -28,3 +29,9 @@ def validate_path(path):
     if not perm(Path(path), R_OK):
         raise PermissionError(f"Could not read: {str(Path(path).resolve())}")
 
+def cache_key(path: str) -> str:
+    # Stable, filesystem-safe id for a submission: its own name plus a short hash of the
+    # full absolute path, so two "submission1" folders from different root_dirs never collide
+    abs_path = str(Path(path).resolve())
+    digest = hashlib.sha1(abs_path.encode()).hexdigest()[:8]
+    return f"{Path(path).name}_{digest}"
