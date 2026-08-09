@@ -4,7 +4,13 @@ This file takes in multiple submission root directories and spits out submission
 
 import glob
 import os
+import threading
 import networkx as nx
+
+# pydot's dot parser isn't thread-safe, and pipeline.py calls load_graph()
+# from multiple threads. This lock makes sure only one thread parses a
+# .dot file at a time, so parses don't corrupt each other.
+_DOT_PARSE_LOCK = threading.Lock()
 
 
 def load_graph(path: str) -> nx.MultiGraph:
@@ -17,7 +23,8 @@ def load_graph(path: str) -> nx.MultiGraph:
     node_offset = 0
 
     for dot_file in dot_files:
-        g = nx.drawing.nx_pydot.read_dot(dot_file)
+        with _DOT_PARSE_LOCK:
+            g = nx.drawing.nx_pydot.read_dot(dot_file)
 
         if not isinstance(g, (nx.Graph, nx.DiGraph, nx.MultiGraph, nx.MultiDiGraph)):
             raise TypeError(f"{dot_file} returned unexpected type {type(g)}")
