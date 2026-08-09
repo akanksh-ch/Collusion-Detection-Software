@@ -2,6 +2,7 @@ numpy>=1.26,<2.0
 scipy>=1.11,<1.13
 scikit-learn>=1.4,<1.6
 networkx>=3.2
+pydot>=2.0
 pandas>=2.0
 snfpy==0.2.2
 python-igraph>=0.11
