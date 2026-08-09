@@ -52,6 +52,35 @@ def compute_metrics(submission_paths: list[str], ground_truth: dict[str, int], p
 
     return results
 
+def compute_pairwise_metrics(pairs: list[tuple[str, str, int]], similarity_matrices: dict[str, np.ndarray], submission_paths: list[str]) -> dict:
+
+    # aligning: build a path -> index lookup once, raising rather than silently skipping if a labeled pair
+    # references a submission not present in submission_paths, consistent with the pipeline's no-silent-drop policy
+    index_by_path = {p: i for i, p in enumerate(submission_paths)}
+    missing = sorted({p for a, b, _ in pairs for p in (a, b) if p not in index_by_path})
+    if missing:
+        raise ValueError(f"{len(missing)} labeled-pair submissions missing from submission_paths: {missing}")
+
+    # pairwise: resolve each explicit (path_a, path_b, verdict) triple to matrix indices and a binary label array,
+    # scoring ONLY these pairs rather than the full C(n,2) corpus, since labels.csv is a sparse curated subset
+    ia = np.array([index_by_path[a] for a, b, v in pairs])
+    ib = np.array([index_by_path[b] for a, b, v in pairs])
+    y_true_pairs = np.array([v for a, b, v in pairs])
+
+    results = {"n_pairs": len(pairs), "n_positive": int(y_true_pairs.sum()), "similarity_auc": {}}
+
+    # scoring similarity: for each named similarity matrix (fused or per-signal), score its pairwise ROC-AUC and
+    # PR-AUC against the sparse ground truth; no clustering metrics, since a sparse label set can't be scored
+    # against a full partition
+    for name, matrix in similarity_matrices.items():
+        y_score_pairs = matrix[ia, ib]
+        results["similarity_auc"][name] = {
+            "roc_auc": float(roc_auc_score(y_true_pairs, y_score_pairs)),
+            "pr_auc": float(average_precision_score(y_true_pairs, y_score_pairs)),
+        }
+
+    return results
+
 if __name__ == '__main__':
     import argparse
 
