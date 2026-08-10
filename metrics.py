@@ -87,17 +87,21 @@ if __name__ == '__main__':
     # loading: read the ordered path list, ground-truth labels, fused/per-signal matrices, and any number of named cluster result files
     parser = argparse.ArgumentParser(description="Score predicted clusters and similarity matrices against ground truth")
     parser.add_argument("--paths", required=True, help="Path to paths.json (ordered submission ID list)")
-    parser.add_argument("--ground-truth", required=True, help="Path to labels.json (submission path -> ground-truth group id)")
+    parser.add_argument("--ground-truth", default=None, help="Path to labels.json (submission path -> ground-truth group id). Mutually exclusive with --conplag-labels-csv.")
+    parser.add_argument("--conplag-labels-csv", default=None, help="Path to ConPlag's labels.csv (sub1,sub2,problem,verdict). Mutually exclusive with --ground-truth; scores sparse pairwise AUC only, no clustering metrics.")
     parser.add_argument("--fused", required=True, help="Path to S_fused.npy")
     parser.add_argument("--signal", nargs=2, action="append", default=[], metavar=("NAME", "PATH"), help="Extra named similarity/embedding matrix, e.g. --signal gst gst_coverage.npy")
-    parser.add_argument("--clusters", nargs=2, action="append", required=True, metavar=("NAME", "PATH"), help="Named predicted cluster file, e.g. --clusters hdbscan clusters_hdbscan.json")
+    parser.add_argument("--clusters", nargs=2, action="append", default=[], metavar=("NAME", "PATH"), help="Named predicted cluster file, e.g. --clusters hdbscan clusters_hdbscan.json. Ignored with --conplag-labels-csv.")
     parser.add_argument("--output", default=None, help="Optional path to write the resulting metrics as JSON")
     args = parser.parse_args()
 
+    if bool(args.ground_truth) == bool(args.conplag_labels_csv):
+        parser.error("specify exactly one of --ground-truth or --conplag-labels-csv")
+    if args.ground_truth and not args.clusters:
+        parser.error("--clusters is required with --ground-truth")
+
     with open(args.paths) as f:
         submission_paths = json.load(f)
-    with open(args.ground_truth) as f:
-        ground_truth = json.load(f)
 
     from sklearn.metrics.pairwise import cosine_similarity
     similarity_matrices = {"fused": np.load(args.fused)}
@@ -105,12 +109,35 @@ if __name__ == '__main__':
         mat = np.load(path)
         similarity_matrices[name] = cosine_similarity(mat) if mat.shape[0] != mat.shape[1] else mat
 
-    predicted_clusters = {}
-    for name, path in args.clusters:
-        with open(path) as f:
-            predicted_clusters[name] = json.load(f)
+    if args.conplag_labels_csv:
+        # resolving: match ConPlag's sub1/sub2 hash IDs against the filename stems already present
+        # in submission_paths, avoiding a need for the raw root_dirs just to rebuild that mapping
+        import csv
+        path_by_hash = {p.split("/")[-1].rsplit(".", 1)[0]: p for p in submission_paths}
+        pairs = []
+        skipped = 0
+        with open(args.conplag_labels_csv, newline="") as f:
+            for row in csv.DictReader(f):
+                a, b, v = row["sub1"], row["sub2"], int(row["verdict"])
+                if a not in path_by_hash or b not in path_by_hash:
+                    skipped += 1
+                    continue
+                pairs.append((path_by_hash[a], path_by_hash[b], v))
+        if skipped:
+            print(f"Skipped {skipped} labels.csv pairs with a hash not found in paths.json.")
 
-    metrics = compute_metrics(submission_paths, ground_truth, predicted_clusters, similarity_matrices)
+        metrics = compute_pairwise_metrics(pairs, similarity_matrices, submission_paths)
+    else:
+        with open(args.ground_truth) as f:
+            ground_truth = json.load(f)
+
+        predicted_clusters = {}
+        for name, path in args.clusters:
+            with open(path) as f:
+                predicted_clusters[name] = json.load(f)
+
+        metrics = compute_metrics(submission_paths, ground_truth, predicted_clusters, similarity_matrices)
+
     print(json.dumps(metrics, indent=4))
 
     if args.output:
