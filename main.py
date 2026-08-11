@@ -15,9 +15,10 @@ CACHE_DIR = Path(user_cache_dir('cds', ensure_exists=True))
 
 
 def main(root_dirs: list[str], dataset: str, output: str | None, labels_csv: str | None = None,
-         split: str = 'all', train_pairs_csv: str | None = None, test_pairs_csv: str | None = None) -> dict:
-    # running: execute the full SNF + HDBSCAN/Leiden pipeline, which writes paths.json, S_fused.npy, and both cluster files under CACHE_DIR
-    hdbscan_clusters, leiden_clusters = run_pipeline(root_dirs)
+         split: str = 'all', train_pairs_csv: str | None = None, test_pairs_csv: str | None = None,
+         fusion_method: str = 'snf') -> dict:
+    # running: execute the full fusion + HDBSCAN/Leiden pipeline, which writes paths.json, S_fused.npy, and both cluster files under CACHE_DIR
+    hdbscan_clusters, leiden_clusters = run_pipeline(root_dirs, fusion_method=fusion_method)
 
     # loading: reload the ordered submission paths and fused similarity matrix that run_pipeline just wrote to CACHE_DIR
     import numpy as np
@@ -67,7 +68,9 @@ if __name__ == "__main__":
     parser.add_argument("--split", choices=['train', 'test', 'all'], default='all', help="For --dataset conplag: restrict to train_pairs.csv, test_pairs.csv, or all of labels.csv")
     parser.add_argument("--train-pairs-csv", default=None, help="Path to train_pairs.csv (required if --split train)")
     parser.add_argument("--test-pairs-csv", default=None, help="Path to test_pairs.csv (required if --split test)")
+    parser.add_argument("--fusion-method", choices=['snf', 'noisy_or'], default='snf', help="Similarity fusion method: SNF cross-diffusion (default) or noisy-OR independent-evidence combination")
     args = parser.parse_args()
 
     main(args.root_dirs, args.dataset, args.output, labels_csv=args.labels_csv,
-         split=args.split, train_pairs_csv=args.train_pairs_csv, test_pairs_csv=args.test_pairs_csv)
+         split=args.split, train_pairs_csv=args.train_pairs_csv, test_pairs_csv=args.test_pairs_csv,
+         fusion_method=args.fusion_method)
