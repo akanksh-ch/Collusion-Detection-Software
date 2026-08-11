@@ -2,4 +2,4 @@
 
 from .joern import generate_cpg
 from .loader import load_graph
-from .embeddings import generate_embedding
+from .embeddings import generate_embedding, EMBEDDING_DIM
