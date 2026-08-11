@@ -32,6 +32,51 @@ def fuse_similarity_networks(matrices: list[np.ndarray], k_neighbors: int = 10, 
 
     return fused_matrix
 
+
+def fuse_noisy_or(matrices: list[np.ndarray], noise_floors: list[float] | None = None) -> np.ndarray:
+    """
+    Combines similarity channels as independent evidence via noisy-OR (1 - product of (1 - s_i)) instead
+    of SNF's cross-diffusion. This is monotonically >= the strongest individual channel and is increased,
+    not diluted, by corroborating channels -- the opposite failure mode of averaging-style fusion, where a
+    noisy channel drags a strong one down. Trade-off: correlated noise across channels is amplified the
+    same way real corroboration is, which inflates unrelated-pair scores if channels share a nonzero
+    baseline. noise_floors calibrates each channel's expected off-diagonal baseline away before combining,
+    so noisy-OR only responds to signal above that channel's typical noise level, not raw similarity.
+    """
+
+    # parsing: same affinity normalization as fuse_similarity_networks, so both fusion modes accept the
+    # same inputs (raw embeddings or precomputed square similarity matrices) interchangeably
+    affinities = []
+    for mat in matrices:
+        sim = cosine_similarity(mat) if mat.shape[0] != mat.shape[1] else mat
+        sim = np.clip(sim, 0, None)
+        np.fill_diagonal(sim, 1.0)
+        affinities.append(sim)
+
+    n = affinities[0].shape[0]
+    off_diag_mask = ~np.eye(n, dtype=bool)
+
+    # calibrating: subtract each channel's own noise floor and rescale the remainder onto [0,1], so a
+    # channel sitting at a 0.2 baseline for unrelated pairs contributes ~0 evidence instead of inflating
+    # the noisy-OR product; floors default to each channel's own off-diagonal median if not supplied
+    calibrated = []
+    for i, sim in enumerate(affinities):
+        floor = noise_floors[i] if noise_floors is not None else float(np.median(sim[off_diag_mask]))
+        adjusted = np.clip((sim - floor) / (1 - floor + 1e-12), 0, 1)
+        np.fill_diagonal(adjusted, 1.0)
+        calibrated.append(adjusted)
+
+    # combining: noisy-OR treats each calibrated channel as independent evidence of collusion; a single
+    # strong channel already pushes the product near 0 (fused near 1), and additional corroborating
+    # channels push it further, rather than being averaged back down by weaker/noisier channels
+    complement_product = np.ones((n, n))
+    for adjusted in calibrated:
+        complement_product *= (1 - adjusted)
+    fused_matrix = 1 - complement_product
+    np.fill_diagonal(fused_matrix, 1.0)
+
+    return fused_matrix
+
 if __name__ == '__main__':
     import argparse
 

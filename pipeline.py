@@ -29,7 +29,7 @@ LEXICAL_CACHE_DIR = CACHE_DIR / "lexical"
 GST_CACHE_DIR = CACHE_DIR / "gst"
 
 
-def run_pipeline(root_dirs: list[str]):
+def run_pipeline(root_dirs: list[str], fusion_method: str = 'snf'):
     # hardware: size the thread pool and per-worker RAM budget safely, guarding against 0 workers or negative RAM on constrained/single-core machines
     max_workers = max(1, util.get_cpu())
     total_ram = util.get_ram()
@@ -70,7 +70,7 @@ def run_pipeline(root_dirs: list[str]):
             return sub_path_str, embedding, True
         except Exception as e:
             logger.warning(f"Graph pipeline failed for {sub_path_str}: {e}")
-            return sub_path_str, np.zeros(250), False
+            return sub_path_str, np.zeros(graph.EMBEDDING_DIM), False
 
     graph_embeddings_dict = {}
     failed_submissions = []
@@ -101,9 +101,17 @@ def run_pipeline(root_dirs: list[str]):
     gst_coverage = strmatch.compute_gst_coverage(submission_paths)
     np.save(GST_CACHE_DIR / "gst_coverage.npy", gst_coverage)
 
-    # fusion: combine the topological, lexical, and GST similarity networks into one fused matrix via SNF
-    logger.info("Fusing similarity networks...")
-    fused_matrix = fusion.fuse_similarity_networks([v_topo, v_lex, gst_coverage])
+    # fusion: combine the topological, lexical, and GST similarity networks into one fused matrix, via
+    # either SNF's cross-diffusion or noisy-OR's independent-evidence combination (see fusion.py docstrings
+    # for the trade-off: SNF averages/smooths across channels, noisy-OR preserves and boosts the strongest
+    # signal but is more sensitive to correlated channel noise on unrelated pairs)
+    logger.info(f"Fusing similarity networks ({fusion_method})...")
+    if fusion_method == 'snf':
+        fused_matrix = fusion.fuse_similarity_networks([v_topo, v_lex, gst_coverage])
+    elif fusion_method == 'noisy_or':
+        fused_matrix = fusion.fuse_noisy_or([v_topo, v_lex, gst_coverage])
+    else:
+        raise ValueError(f"Unknown fusion_method: {fusion_method!r} (expected 'snf' or 'noisy_or')")
     np.save(CACHE_DIR / "S_fused.npy", fused_matrix)
 
     # clustering: run HDBSCAN as the primary clustering method, since its density adapts locally across the
@@ -131,6 +139,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Run the full SNF + HDBSCAN/Leiden pipeline across multiple roots")
     parser.add_argument("root_dirs", nargs='+', help="One or more root directories containing submissions")
+    parser.add_argument("--fusion-method", choices=['snf', 'noisy_or'], default='snf', help="Similarity fusion method: SNF cross-diffusion (default) or noisy-OR independent-evidence combination")
     args = parser.parse_args()
 
-    run_pipeline(args.root_dirs)
+    run_pipeline(args.root_dirs, fusion_method=args.fusion_method)
