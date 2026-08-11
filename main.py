@@ -9,7 +9,7 @@ from platformdirs import user_cache_dir
 
 from pipeline import run_pipeline
 from metrics import compute_metrics, compute_pairwise_metrics
-from labels import generate_labels_criminalminds, generate_labels_irplag, generate_pairwise_labels_conplag
+from labels import generate_labels_criminalminds, generate_labels_irplag, generate_labels_progpedia19, generate_pairwise_labels_conplag
 
 CACHE_DIR = Path(user_cache_dir('cds', ensure_exists=True))
 
@@ -40,6 +40,8 @@ def main(root_dirs: list[str], dataset: str, output: str | None, labels_csv: str
         # labeling: build the ground-truth path -> group_id mapping with whichever generator matches this dataset's naming convention
         if dataset == 'criminalminds':
             ground_truth = generate_labels_criminalminds(root_dirs)
+        elif dataset == 'progpedia19':
+            ground_truth = generate_labels_progpedia19(root_dirs)
         else:
             ground_truth = generate_labels_irplag(root_dirs)
 
@@ -59,7 +61,7 @@ def main(root_dirs: list[str], dataset: str, output: str | None, labels_csv: str
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the collusion-detection pipeline and score it against ground truth")
     parser.add_argument("root_dirs", nargs='+', help="One or more root directories containing submissions")
-    parser.add_argument("--dataset", choices=['criminalminds', 'irplag', 'conplag'], required=True, help="Which ground-truth convention to use")
+    parser.add_argument("--dataset", choices=['criminalminds', 'irplag', 'progpedia19', 'conplag'], required=True, help="Which ground-truth convention to use")
     parser.add_argument("--output", default=None, help="Optional path to write the resulting metrics as JSON")
     parser.add_argument("--labels-csv", default=None, help="Path to labels.csv (required if --dataset conplag)")
     parser.add_argument("--split", choices=['train', 'test', 'all'], default='all', help="For --dataset conplag: restrict to train_pairs.csv, test_pairs.csv, or all of labels.csv")
