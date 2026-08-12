@@ -29,13 +29,21 @@ LEXICAL_CACHE_DIR = CACHE_DIR / "lexical"
 GST_CACHE_DIR = CACHE_DIR / "gst"
 
 
-def run_pipeline(root_dirs: list[str], fusion_method: str = 'snf'):
+def run_pipeline(root_dirs: list[str], fusion_method: str = 'snf', output_dir: str = None):
+    # results: paths.json/S_fused.npy/clusters_*.json/graph_failures.json are the run's actual
+    # deliverables, so they go to output_dir if given (e.g. a bind-mounted host directory that
+    # has to exist ahead of time) instead of CACHE_DIR, which stays reserved for the expensive-
+    # to-recompute, don't-need-to-persist-outside-the-container CPG/lexical/GST artifacts
+    results_dir = Path(output_dir) if output_dir else CACHE_DIR
+    results_dir.mkdir(parents=True, exist_ok=True)
+
     # hardware: size the thread pool and per-worker RAM budget safely, guarding against 0 workers or negative RAM on constrained/single-core machines
     max_workers = max(1, util.get_cpu())
     total_ram = util.get_ram()
     per_worker_ram = max(128, int((total_ram - 1024) // max_workers))
     logger.info(f"Using {max_workers} threads. Allocating {per_worker_ram}MB RAM per Joern worker.")
     logger.info(f"Using cache directory: {CACHE_DIR}")
+    logger.info(f"Using output directory: {results_dir}")
 
     for sub_cache_dir in (CPG_CACHE_DIR, LEXICAL_CACHE_DIR, GST_CACHE_DIR):
         sub_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -52,7 +60,7 @@ def run_pipeline(root_dirs: list[str], fusion_method: str = 'snf'):
     if not submission_paths:
         raise ValueError(f"No submissions found under root_dirs: {root_dirs}")
     submission_paths.sort(key=lambda p: Path(p).name)
-    with open(CACHE_DIR / "paths.json", "w") as f:
+    with open(results_dir / "paths.json", "w") as f:
         json.dump(submission_paths, f)
     logger.info(f"Found {len(submission_paths)} submissions.")
 
@@ -86,7 +94,7 @@ def run_pipeline(root_dirs: list[str], fusion_method: str = 'snf'):
             f"{len(failed_submissions)}/{len(submission_paths)} submissions failed graph "
             f"processing and were filled with zero-vectors: {failed_submissions}"
         )
-        with open(CACHE_DIR / "graph_failures.json", "w") as f:
+        with open(results_dir / "graph_failures.json", "w") as f:
             json.dump(failed_submissions, f, indent=4)
     v_topo = np.array([graph_embeddings_dict[p] for p in submission_paths])
     np.save(CPG_CACHE_DIR / "v_topo.npy", v_topo)
@@ -112,20 +120,20 @@ def run_pipeline(root_dirs: list[str], fusion_method: str = 'snf'):
         fused_matrix = fusion.fuse_noisy_or([v_topo, v_lex, gst_coverage])
     else:
         raise ValueError(f"Unknown fusion_method: {fusion_method!r} (expected 'snf' or 'noisy_or')")
-    np.save(CACHE_DIR / "S_fused.npy", fused_matrix)
+    np.save(results_dir / "S_fused.npy", fused_matrix)
 
     # clustering: run HDBSCAN as the primary clustering method, since its density adapts locally across the
     # graph and it can leave non-colluding submissions unlabeled instead of forcing them into a cluster
     logger.info("Clustering fused network with HDBSCAN...")
     hdbscan_clusters = hdbscan_cluster.run_hdbscan(fused_matrix, submission_paths)
-    hdbscan_output_path = CACHE_DIR / "clusters_hdbscan.json"
+    hdbscan_output_path = results_dir / "clusters_hdbscan.json"
     with open(hdbscan_output_path, "w") as f:
         json.dump(hdbscan_clusters, f, indent=4)
 
     # comparison: also run Leiden/CPM as a comparison point against HDBSCAN, per the dissertation's cluster quality benchmarking
     logger.info("Clustering fused network with Leiden/CPM...")
     leiden_clusters = leiden.run_leiden(fused_matrix, submission_paths)
-    leiden_output_path = CACHE_DIR / "clusters_leiden.json"
+    leiden_output_path = results_dir / "clusters_leiden.json"
     with open(leiden_output_path, "w") as f:
         json.dump(leiden_clusters, f, indent=4)
 
@@ -140,6 +148,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the full SNF + HDBSCAN/Leiden pipeline across multiple roots")
     parser.add_argument("root_dirs", nargs='+', help="One or more root directories containing submissions")
     parser.add_argument("--fusion-method", choices=['snf', 'noisy_or'], default='snf', help="Similarity fusion method: SNF cross-diffusion (default) or noisy-OR independent-evidence combination")
+    parser.add_argument("--output-dir", default=None, help="Where to write paths.json/S_fused.npy/clusters_*.json/graph_failures.json (e.g. a pre-created bind-mount target). Defaults to the CACHE_DIR used for CPG/lexical/GST caching if omitted.")
     args = parser.parse_args()
 
-    run_pipeline(args.root_dirs, fusion_method=args.fusion_method)
+    run_pipeline(args.root_dirs, fusion_method=args.fusion_method, output_dir=args.output_dir)
