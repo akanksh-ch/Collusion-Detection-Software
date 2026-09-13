@@ -16,9 +16,15 @@ CACHE_DIR = Path(user_cache_dir('cds', ensure_exists=True))
 
 def main(root_dirs: list[str], dataset: str, output: str | None, labels_csv: str | None = None,
          split: str = 'all', train_pairs_csv: str | None = None, test_pairs_csv: str | None = None,
-         fusion_method: str = 'snf') -> dict:
-    # running: execute the full fusion + HDBSCAN/Leiden pipeline, which writes paths.json, S_fused.npy, and both cluster files under CACHE_DIR
-    hdbscan_clusters, leiden_clusters = run_pipeline(root_dirs, fusion_method=fusion_method)
+         fusion_method: str = 'snf', agglo_distance_threshold: float = 0.5, agglo_linkage: str = 'average',
+         hdbscan_min_cluster_size: int = 2, hdbscan_min_samples: int | None = None,
+         leiden_resolution: float = 0.1, leiden_threshold: float = 0.5, auto_tune: bool = False) -> dict:
+    # running: execute the full fusion + HDBSCAN/Leiden/Agglomerative pipeline, which writes paths.json, S_fused.npy, and all three cluster files under CACHE_DIR
+    hdbscan_clusters, leiden_clusters, agglomerative_clusters = run_pipeline(
+        root_dirs, fusion_method=fusion_method, agglo_distance_threshold=agglo_distance_threshold, agglo_linkage=agglo_linkage,
+        hdbscan_min_cluster_size=hdbscan_min_cluster_size, hdbscan_min_samples=hdbscan_min_samples,
+        leiden_resolution=leiden_resolution, leiden_threshold=leiden_threshold, auto_tune=auto_tune
+    )
 
     # loading: reload the ordered submission paths and fused similarity matrix that run_pipeline just wrote to CACHE_DIR
     import numpy as np
@@ -46,8 +52,8 @@ def main(root_dirs: list[str], dataset: str, output: str | None, labels_csv: str
         else:
             ground_truth = generate_labels_irplag(root_dirs)
 
-        # scoring: compare the fused matrix and both cluster assignments against ground truth
-        predicted_clusters = {"hdbscan": hdbscan_clusters, "leiden": leiden_clusters}
+        # scoring: compare the fused matrix and all three cluster assignments against ground truth
+        predicted_clusters = {"hdbscan": hdbscan_clusters, "leiden": leiden_clusters, "agglomerative": agglomerative_clusters}
         metrics = compute_metrics(submission_paths, ground_truth, predicted_clusters, similarity_matrices)
 
     print(json.dumps(metrics, indent=4))
@@ -69,8 +75,17 @@ if __name__ == "__main__":
     parser.add_argument("--train-pairs-csv", default=None, help="Path to train_pairs.csv (required if --split train)")
     parser.add_argument("--test-pairs-csv", default=None, help="Path to test_pairs.csv (required if --split test)")
     parser.add_argument("--fusion-method", choices=['snf', 'noisy_or'], default='snf', help="Similarity fusion method: SNF cross-diffusion (default) or noisy-OR independent-evidence combination")
+    parser.add_argument("--agglo-distance-threshold", type=float, default=0.5, help="Distance threshold for agglomerative clustering (ignored if --auto-tune is set)")
+    parser.add_argument("--agglo-linkage", default="average", choices=["average", "complete", "single"], help="Linkage criterion for agglomerative clustering")
+    parser.add_argument("--hdbscan-min-cluster-size", type=int, default=2, help="HDBSCAN min_cluster_size (ignored if --auto-tune is set)")
+    parser.add_argument("--hdbscan-min-samples", type=int, default=None, help="HDBSCAN min_samples (ignored if --auto-tune is set)")
+    parser.add_argument("--leiden-resolution", type=float, default=0.1, help="Leiden/CPM resolution_parameter (ignored if --auto-tune is set)")
+    parser.add_argument("--leiden-threshold", type=float, default=0.5, help="Leiden similarity threshold below which edges are dropped")
+    parser.add_argument("--auto-tune", action="store_true", help="Sweep and pick HDBSCAN/Leiden/Agglomerative params via DBCV instead of using the fixed values above (no ground truth needed; ARI/NMI against --dataset's labels is still reported afterward purely for evaluation)")
     args = parser.parse_args()
 
     main(args.root_dirs, args.dataset, args.output, labels_csv=args.labels_csv,
          split=args.split, train_pairs_csv=args.train_pairs_csv, test_pairs_csv=args.test_pairs_csv,
-         fusion_method=args.fusion_method)
+         fusion_method=args.fusion_method, agglo_distance_threshold=args.agglo_distance_threshold, agglo_linkage=args.agglo_linkage,
+         hdbscan_min_cluster_size=args.hdbscan_min_cluster_size, hdbscan_min_samples=args.hdbscan_min_samples,
+         leiden_resolution=args.leiden_resolution, leiden_threshold=args.leiden_threshold, auto_tune=args.auto_tune)
