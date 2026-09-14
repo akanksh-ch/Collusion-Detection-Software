@@ -66,8 +66,10 @@ def run_pipeline(root_dirs: list[str], fusion_method: str = 'snf', output_dir: s
         json.dump(submission_paths, f)
     logger.info(f"Found {len(submission_paths)} submissions.")
 
-    # graph: run Joern parse -> load -> NetLSD embedding concurrently across submissions, filling failures with a zero-vector instead of silently dropping them
-    def process_graph_for_submission(sub_path_str: str) -> tuple[str, np.ndarray, bool]:
+    # graph: run Joern parse -> load concurrently across submissions, filling failures with None
+    # instead of silently dropping them -- embedding happens after the pool, since Graph2Vec fits
+    # one Doc2Vec model across the whole batch rather than one graph at a time
+    def process_graph_for_submission(sub_path_str: str) -> tuple[str, object, bool]:
         # give each submission its own folder under CPG_CACHE_DIR (name + path hash) so the
         # .bin/_export artifacts never land in submissions/ and never collide across roots
         sub_cpg_dir = CPG_CACHE_DIR / util.cache_key(sub_path_str)
@@ -76,19 +78,18 @@ def run_pipeline(root_dirs: list[str], fusion_method: str = 'snf', output_dir: s
             if not export_dir.exists():
                 export_dir = Path(graph.generate_cpg(sub_path_str, per_worker_ram, out_dir=sub_cpg_dir))
             nx_graph = graph.load_graph(str(export_dir))
-            embedding = graph.generate_embedding(nx_graph)
-            return sub_path_str, embedding, True
+            return sub_path_str, nx_graph, True
         except Exception as e:
             logger.warning(f"Graph pipeline failed for {sub_path_str}: {e}")
-            return sub_path_str, np.zeros(graph.EMBEDDING_DIM), False
+            return sub_path_str, None, False
 
-    graph_embeddings_dict = {}
+    graphs_by_path = {}
     failed_submissions = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(process_graph_for_submission, p): p for p in submission_paths}
         for future in as_completed(futures):
-            path_str, emb, success = future.result()
-            graph_embeddings_dict[path_str] = emb
+            path_str, nx_graph, success = future.result()
+            graphs_by_path[path_str] = nx_graph
             if not success:
                 failed_submissions.append(path_str)
     if failed_submissions:
@@ -98,7 +99,16 @@ def run_pipeline(root_dirs: list[str], fusion_method: str = 'snf', output_dir: s
         )
         with open(results_dir / "graph_failures.json", "w") as f:
             json.dump(failed_submissions, f, indent=4)
-    v_topo = np.array([graph_embeddings_dict[p] for p in submission_paths])
+
+    # embedding: batch-fit Graph2Vec once across every successfully-parsed graph, then fill any
+    # failures with zero-vectors so v_topo still lines up 1:1 with submission_paths
+    logger.info("Generating graph embeddings...")
+    ok_paths = [p for p in submission_paths if graphs_by_path[p] is not None]
+    ok_embeddings = graph.generate_embeddings([graphs_by_path[p] for p in ok_paths])
+    embedding_by_path = dict(zip(ok_paths, ok_embeddings))
+    v_topo = np.array([
+        embedding_by_path.get(p, np.zeros(graph.DIMENSIONS)) for p in submission_paths
+    ])
     np.save(CPG_CACHE_DIR / "v_topo.npy", v_topo)
 
     # lexical: compute the shared-vocabulary TF-IDF char n-gram embedding matrix over the same ordered submission list
