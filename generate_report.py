@@ -31,7 +31,11 @@ def copy_submission_files(zf: zipfile.ZipFile, submission_paths: list[str]) -> d
         sources = [sub_path] if sub_path.is_file() else sorted(p for p in sub_path.rglob("*") if p.is_file())
         file_index[sub_id] = {}
         for src in sources:
-            rel_name = src.name if sub_path.is_file() else str(src.relative_to(sub_path))
+            rel_name = (
+                src.name
+                if sub_path.is_file()
+                else src.relative_to(sub_path).as_posix()
+            )
             arcname = f"files/{sub_id}/{rel_name}"
             zf.write(src, arcname)
             # tokenCount: real JPlag fills this from its own tokenizer, which we don't run here, so 0 is an honest placeholder rather than a fabricated count
@@ -138,6 +142,8 @@ def build_jplag_archive(output_path: str, submission_paths: list[str], fused_mat
         # files + submissionFileIndex: copy every submission's real source into files/<id>/... so the viewer can display it even without match highlighting
         file_index = copy_submission_files(zf, submission_paths)
         zf.writestr("submissionFileIndex.json", json.dumps({"fileIndexes": file_index}))
+        for sid in ids:
+            zf.writestr(f"basecode/{sid}.json", json.dumps([]))
 
 
 def generate_report(root_dirs: list[str], output_dir: str, fusion_method: str = 'snf', cluster_method: str = 'hdbscan', auto_tune: bool = True) -> str:

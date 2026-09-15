@@ -12,20 +12,41 @@ TOKEN_RE = re.compile(r"\w+|[^\w\s]")
 PUA_START = 0xE100      # private-use-area codepoints, one per distinct token
 BYTES_PER_TOKEN = 3     # match() indexes in UTF-8 bytes; PUA chars are always 3 bytes
 
-
-def tokenize_with_positions(path_str: str) -> tuple[list[str], list[tuple[str, int, int]]]:
-    # parsing: load every file under a submission and tokenize it, tracking each token's (filename, line, column) alongside its text so tile offsets can be mapped back to a real source location later
+def tokenize_with_positions(path_str: str,) -> tuple[list[str], list[tuple[str, int, int]]]:
     path = Path(path_str)
-    files = [path] if path.is_file() else sorted(p for p in path.rglob("*") if p.is_file())
-    tokens, positions = [], []
+
+    # The submission directory name is the submission ID used by
+    # submissionFileIndex.json and the files/ archive directory.
+    submission_id = path.name
+
+    files = (
+        [path]
+        if path.is_file()
+        else sorted(p for p in path.rglob("*") if p.is_file())
+    )
+
+    tokens = []
+    positions = []
+
     for f in files:
         text = f.read_text(encoding="utf-8", errors="replace")
+
+        if path.is_file():
+            rel_name = f.name
+        else:
+            rel_name = f.relative_to(path).as_posix()
+
+        file_name = f"{submission_id}/{rel_name}"
+
         for m in TOKEN_RE.finditer(text):
             tokens.append(m.group())
+
             line = text.count("\n", 0, m.start()) + 1
             last_newline = text.rfind("\n", 0, m.start())
             column = m.start() - last_newline
-            positions.append((f.name, line, column))
+
+            positions.append((file_name, line, column))
+
     return tokens, positions
 
 
