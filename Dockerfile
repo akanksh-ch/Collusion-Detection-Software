@@ -33,6 +33,12 @@ COPY requirements.txt .
 # Karateclub (Graph2Vec) has older pandas and numpy versions, we're overriding them
 RUN uv pip install --system -r requirements.txt --override requirements.txt
 
+# karateclub is abandoned and pins numpy<1.23/networkx<2.7/pandas<=1.3.5, which conflict with
+# the versions above. Its code works fine on the newer versions, so install it with no deps
+# and pull in its other runtime deps (missing from requirements.txt) separately.
+RUN uv pip install --system --no-deps karateclub==1.3.3 \
+    && uv pip install --system python-louvain pygsp python-Levenshtein decorator
+
 # Python changes seed per process, setting env variable to prevent this. Refer (PEP 456)
 ENV PYTHONHASHSEED=0
 
