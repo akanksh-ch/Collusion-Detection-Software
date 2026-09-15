@@ -97,7 +97,7 @@ def build_jplag_archive(output_path: str, submission_paths: list[str], fused_mat
 
         # runInformation: real total-comparisons count, honest zero/empty for the stats we don't track (execution time, failures)
         run_info = {
-            "version": {"major": 0, "minor": 0, "patch": 0}, "failedSubmissions": [],
+            "version": {"major": 6, "minor": 3, "patch": 0}, "failedSubmissions": [],
             "dateOfExecution": datetime.date.today().strftime("%d/%m/%y"),
             "executionTime": 0, "totalComparisons": int(len(iu)),
         }
