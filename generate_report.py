@@ -78,9 +78,12 @@ def build_jplag_archive(output_path: str, submission_paths: list[str], fused_mat
         avg_sim = float(np.mean(pair_scores)) if pair_scores else 0.0
         cluster_list.append({"averageSimilarity": avg_sim, "strength": 0.0, "members": members})
 
+    # submissionIdsToComparisonFileName: sid -> {other_sid: comparison_filename}, required by the
+    # viewer's convertComparisonFilesLookup (it Object.entries()'s this with no undefined check)
+    submission_ids_to_comparison_file_name: dict[str, dict[str, str]] = {sid: {} for sid in ids}
+
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("README.txt", README_TEXT)
-        zf.writestr("submissionMappings.json", json.dumps({"submissionIds": submission_ids}))
         zf.writestr("cluster.json", json.dumps(cluster_list))
         zf.writestr("distribution.json", json.dumps(build_distribution(fused_matrix)))
 
@@ -107,13 +110,21 @@ def build_jplag_archive(output_path: str, submission_paths: list[str], fused_mat
         for a, b in zip(iu.tolist(), ju.tolist()):
             score = float(fused_matrix[a, b])
             matches = gst_matches.get((ids[a], ids[b])) or gst_matches.get((ids[b], ids[a])) or []
+            comp_filename = f"{ids[a]}-{ids[b]}.json"
             comp = {
                 "firstSubmissionId": ids[a], "secondSubmissionId": ids[b],
                 "similarities": {"AVG": score, "MAX": score},
                 "matches": matches,
                 "firstSimilarity": score, "secondSimilarity": score,
             }
-            zf.writestr(f"comparisons/{ids[a]}-{ids[b]}.json", json.dumps(comp))
+            zf.writestr(f"comparisons/{comp_filename}", json.dumps(comp))
+            submission_ids_to_comparison_file_name[ids[a]][ids[b]] = comp_filename
+            submission_ids_to_comparison_file_name[ids[b]][ids[a]] = comp_filename
+
+        zf.writestr("submissionMappings.json", json.dumps({
+            "submissionIds": submission_ids,
+            "submissionIdsToComparisonFileName": submission_ids_to_comparison_file_name,
+        }))
 
         # topComparisons: the highest-scoring pairs overall, same shape as JPlag's own summary list
         order = np.argsort(-fused_matrix[iu, ju])[:min(100, len(iu))]
