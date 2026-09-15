@@ -116,10 +116,12 @@ def run_pipeline(root_dirs: list[str], fusion_method: str = 'snf', output_dir: s
     v_lex = lexical.generate_embeddings(submission_paths)
     np.save(LEXICAL_CACHE_DIR / "v_lex.npy", v_lex)
 
-    # gst: compute the pairwise Greedy String Tiling coverage matrix, the strongest single signal
+    # gst: compute the pairwise Greedy String Tiling coverage matrix, the strongest single signal -- also pull the underlying tile match spans, since mapping them to file/line/column costs ~1-2% on top of the coverage computation itself (see strmatch.py) and archive.jplag's match-highlighting needs them
     logger.info("Computing GST coverage...")
-    gst_coverage = strmatch.compute_gst_coverage(submission_paths)
+    gst_coverage, gst_matches = strmatch.compute_gst_coverage(submission_paths, return_matches=True)
     np.save(GST_CACHE_DIR / "gst_coverage.npy", gst_coverage)
+    with open(GST_CACHE_DIR / "gst_matches.json", "w") as f:
+        json.dump([{"first": a, "second": b, "matches": m} for (a, b), m in gst_matches.items()], f)
 
     # fusion: combine the topological, lexical, and GST similarity networks into one fused matrix, via
     # either SNF's cross-diffusion or noisy-OR's independent-evidence combination (see fusion.py docstrings

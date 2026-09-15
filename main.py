@@ -7,10 +7,10 @@ import json
 from pathlib import Path
 from platformdirs import user_cache_dir
 
-from pipeline import run_pipeline
+from pipeline import run_pipeline, GST_CACHE_DIR
 from metrics import compute_metrics, compute_pairwise_metrics
 from labels import generate_labels_criminalminds, generate_labels_irplag, generate_labels_progpedia19, generate_pairwise_labels_conplag
-from generate_report import build_jplag_archive
+from generate_report import build_jplag_archive, load_gst_matches
 
 CACHE_DIR = Path(user_cache_dir('cds', ensure_exists=True))
 
@@ -42,7 +42,8 @@ def main(root_dirs: list[str], dataset: str | None, output: str | None, labels_c
     if dataset is None:
         # blind: no ground truth given, so the default outcome is a JPlag-viewer-compatible archive instead of scored metrics
         archive_path = output or str(CACHE_DIR / "archive.jplag")
-        build_jplag_archive(archive_path, submission_paths, fused_matrix, predicted_clusters[cluster_method], root_dirs)
+        gst_matches = load_gst_matches(GST_CACHE_DIR / "gst_matches.json")
+        build_jplag_archive(archive_path, submission_paths, fused_matrix, predicted_clusters[cluster_method], root_dirs, gst_matches=gst_matches)
         print(f"Wrote {archive_path}")
         return archive_path
 
