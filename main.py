@@ -97,7 +97,7 @@ if __name__ == "__main__":
     parser.add_argument("--leiden-resolution", type=float, default=0.1, help="Leiden/CPM resolution_parameter (ignored if --auto-tune is set)")
     parser.add_argument("--leiden-threshold", type=float, default=0.5, help="Leiden similarity threshold below which edges are dropped")
     parser.add_argument("--auto-tune", action="store_true", default=None, help="Sweep and pick HDBSCAN/Leiden/Agglomerative params via DBCV instead of using the fixed values above. Defaults on in blind mode (no --dataset) since there's no ground truth to hand-tune against, and off in --dataset mode; pass this flag to force it on either way")
-    parser.add_argument("--cluster-method", choices=['hdbscan', 'leiden', 'agglomerative'], default='hdbscan', help="Which clustering to bake into archive.jplag's cluster.json in blind mode (ignored if --dataset is set)")
+    parser.add_argument("--cluster-method", choices=['hdbscan', 'leiden', 'agglomerative'], default='agglomerative', help="Which clustering to bake into archive.jplag's cluster.json in blind mode (ignored if --dataset is set)")
     args = parser.parse_args()
 
     main(args.root_dirs, args.dataset, args.output, labels_csv=args.labels_csv,
