@@ -31,7 +31,7 @@ LEXICAL_CACHE_DIR = CACHE_DIR / "lexical"
 GST_CACHE_DIR = CACHE_DIR / "gst"
 
 
-def run_pipeline(root_dirs: list[str], fusion_method: str = 'snf', output_dir: str = None, agglo_distance_threshold: float = 0.5, agglo_linkage: str = 'average', hdbscan_min_cluster_size: int = 2, hdbscan_min_samples: int = None, leiden_resolution: float = 0.1, leiden_threshold: float = 0.5, auto_tune: bool = False):
+def run_pipeline(root_dirs: list[str], fusion_method: str = 'snf', output_dir: str = None, agglo_distance_threshold: float = 0.5, agglo_linkage: str = 'average', hdbscan_min_cluster_size: int = 2, hdbscan_min_samples: int = None, hdbscan_cluster_selection_epsilon: float = 0.0, leiden_resolution: float = 0.1, leiden_threshold: float = 0.5, auto_tune: bool = False):
     # results: paths.json/S_fused.npy/clusters_*.json/graph_failures.json are the run's actual
     # deliverables, so they go to output_dir if given (e.g. a bind-mounted host directory that
     # has to exist ahead of time) instead of CACHE_DIR, which stays reserved for the expensive-
@@ -136,36 +136,31 @@ def run_pipeline(root_dirs: list[str], fusion_method: str = 'snf', output_dir: s
         raise ValueError(f"Unknown fusion_method: {fusion_method!r} (expected 'snf' or 'noisy_or')")
     np.save(results_dir / "S_fused.npy", fused_matrix)
 
-    # tuning: with no ground truth available at deployment time, tuning.py picks each clusterer's
-    # hyperparameter by sweeping DBCV on the fused distance matrix instead of scoring against labels
     if auto_tune:
         logger.info("Auto-tuning HDBSCAN, Leiden, and Agglomerative via DBCV (no ground truth used)...")
         tuning_result = tuning.select_cluster_params(fused_matrix, submission_paths, leiden_threshold=leiden_threshold, agglo_linkage=agglo_linkage)
         hdbscan_min_cluster_size = tuning_result["params"]["hdbscan_min_cluster_size"]
         hdbscan_min_samples = tuning_result["params"]["hdbscan_min_samples"]
+        hdbscan_cluster_selection_epsilon = tuning_result["params"]["hdbscan_cluster_selection_epsilon"]
         leiden_resolution = tuning_result["params"]["leiden_resolution"]
         agglo_distance_threshold = tuning_result["params"]["agglo_distance_threshold"]
+        agglo_linkage = tuning_result["params"]["agglo_linkage"]
         logger.info(f"Auto-tuned params: {tuning_result['params']}")
         with open(results_dir / "auto_tune_report.json", "w") as f:
             json.dump(tuning_result["report"], f, indent=4)
 
-    # clustering: run HDBSCAN as the primary clustering method, since its density adapts locally across the
-    # graph and it can leave non-colluding submissions unlabeled instead of forcing them into a cluster
     logger.info("Clustering fused network with HDBSCAN...")
-    hdbscan_clusters = hdbscan_cluster.run_hdbscan(fused_matrix, submission_paths, min_cluster_size=hdbscan_min_cluster_size, min_samples=hdbscan_min_samples)
+    hdbscan_clusters = hdbscan_cluster.run_hdbscan(fused_matrix, submission_paths, min_cluster_size=hdbscan_min_cluster_size, min_samples=hdbscan_min_samples, cluster_selection_epsilon=hdbscan_cluster_selection_epsilon)
     hdbscan_output_path = results_dir / "clusters_hdbscan.json"
     with open(hdbscan_output_path, "w") as f:
         json.dump(hdbscan_clusters, f, indent=4)
 
-    # comparison: also run Leiden/CPM as a comparison point against HDBSCAN, per the dissertation's cluster quality benchmarking
     logger.info("Clustering fused network with Leiden/CPM...")
     leiden_clusters = leiden.run_leiden(fused_matrix, submission_paths, resolution=leiden_resolution, threshold=leiden_threshold)
     leiden_output_path = results_dir / "clusters_leiden.json"
     with open(leiden_output_path, "w") as f:
         json.dump(leiden_clusters, f, indent=4)
 
-    # middle-ground: also run agglomerative clustering with a DBCV-tuned distance threshold, as a middle
-    # ground between HDBSCAN's conservatism and Leiden's fragmentation (see agglomerative.py's tune_threshold)
     logger.info(f"Clustering fused network with Agglomerative (distance_threshold={agglo_distance_threshold})...")
     agglomerative_clusters = agglomerative.run_agglomerative(fused_matrix, submission_paths, distance_threshold=agglo_distance_threshold, linkage=agglo_linkage)
     agglomerative_output_path = results_dir / "clusters_agglomerative.json"

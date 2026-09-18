@@ -1,24 +1,16 @@
-"""
-Executes Leiden community detection on a fused similarity matrix to group submissions into distinct collusion clusters, with resolution picked by sweeping DBCV instead of ground truth (CPM's own quality() isn't comparable across different resolution values, since resolution changes the objective itself).
-"""
+"""Leiden/CPM community detection on a fused similarity matrix, resolution tuned by DBCV."""
 
 import numpy as np
 import igraph as ig
 import leidenalg
 from hdbscan.validity import validity_index
 
-def run_leiden(fused_matrix: np.ndarray, submission_paths: list[str], resolution: float = 0.1, threshold: float = 0.5, seed: int = 0) -> dict[str, int]:
 
-    # Threshold the dense similarity matrix to remove weak connections and convert it into a weighted undirected igraph network.
+def run_leiden(fused_matrix: np.ndarray, submission_paths: list[str], resolution: float = 0.1, threshold: float = 0.5, seed: int = 0) -> dict[str, int]:
     adj_matrix = np.where(fused_matrix >= threshold, fused_matrix, 0)
     graph = ig.Graph.Weighted_Adjacency(adj_matrix.tolist(), mode="undirected", loops=False)
-
-    # Assign the raw absolute paths directly to the graph vertices.
     graph.vs["name"] = submission_paths
 
-    # Execute Leiden under CPM rather than modularity/RBConfiguration: CPM's resolution parameter has a
-    # direct interpretation as expected within-community edge density and, unlike modularity, is not
-    # subject to the resolution limit that merges genuinely distinct small communities on small graphs.
     partition = leidenalg.find_partition(
         graph,
         leidenalg.CPMVertexPartition,
@@ -27,30 +19,18 @@ def run_leiden(fused_matrix: np.ndarray, submission_paths: list[str], resolution
         seed=seed
     )
 
-    # Map the resulting community integer assignments back using the graph's internal path names.
-    clusters = {v["name"]: cluster_id for v, cluster_id in zip(graph.vs, partition.membership)}
+    return {v["name"]: cluster_id for v, cluster_id in zip(graph.vs, partition.membership)}
 
-    return clusters
 
 def tune_resolution(fused_matrix: np.ndarray, submission_paths: list[str], resolutions: list[float] = None, threshold: float = 0.5, seed: int = 0) -> dict:
-    """
-    Sweeps the CPM resolution_parameter and scores each candidate partition with DBCV (Moulavi et al.,
-    SDM 2014) computed on the same 1-fused_matrix distance matrix used by HDBSCAN/agglomerative, so all
-    three clusterers' sweeps are scored on a shared, label-free index. CPM's own quality() is deliberately
-    not used here: resolution changes the CPM objective itself, so quality values at different resolutions
-    aren't on a comparable scale.
-    """
+    """Sweeps CPM resolution, scored by DBCV on the shared 1-fused_matrix distance matrix."""
     if resolutions is None:
         resolutions = np.round(np.geomspace(0.01, 1.0, 12), 3).tolist()
 
     distance_matrix = 1.0 - fused_matrix
     np.fill_diagonal(distance_matrix, 0.0)
-    d = distance_matrix.shape[0]
+    d = 2  # DBCV's ambient dimension exponent, fixed constant -- not n_submissions
 
-    # scoring: DBCV is undefined for a single cluster, so resolutions collapsing everything into one
-    # community are skipped rather than assigned a misleading score. Leiden has no noise concept either,
-    # so isolated points become singleton communities -- relabeled -1 for scoring only, same fix as
-    # agglomerative.py's tune_threshold
     sweep = []
     best = None
     for r in resolutions:
@@ -73,20 +53,20 @@ def tune_resolution(fused_matrix: np.ndarray, submission_paths: list[str], resol
 
     return {"best": best, "sweep": sweep}
 
+
 if __name__ == '__main__':
     import argparse
     import json
 
-    # testing: cluster a dummy random fused matrix to independently verify the module's execution
-    parser = argparse.ArgumentParser(description="Run Leiden/CPM community detection (or DBCV resolution sweeping) on a fused similarity matrix")
-    parser.add_argument("--size", type=int, default=45, help="Number of dummy submissions to simulate")
-    parser.add_argument("--resolution", type=float, default=0.1, help="CPM resolution parameter")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Similarity threshold below which edges are dropped")
-    parser.add_argument("--tune", action="store_true", help="Sweep resolution by DBCV instead of clustering once")
+    parser = argparse.ArgumentParser(description="Run Leiden/CPM community detection (or DBCV resolution sweeping)")
+    parser.add_argument("--size", type=int, default=45)
+    parser.add_argument("--resolution", type=float, default=0.1)
+    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--tune", action="store_true")
     args = parser.parse_args()
 
     dummy_raw = np.random.rand(args.size, args.size)
-    dummy_matrix = np.clip((dummy_raw + dummy_raw.T) / 2, 0, 1)  # symmetric, like a real cosine/SNF/GST-derived similarity matrix
+    dummy_matrix = np.clip((dummy_raw + dummy_raw.T) / 2, 0, 1)
     np.fill_diagonal(dummy_matrix, 1.0)
     dummy_paths = [f"submission_{i}" for i in range(args.size)]
 
