@@ -25,7 +25,7 @@ def _feature_labeled(graph: nx.Graph) -> nx.Graph:
 def generate_embeddings(graphs: list[nx.Graph]) -> np.ndarray:
     # fitting: one Doc2Vec model across the entire submission batch, so every submission's
     # embedding lives in the same learned space and is directly cosine-comparable
-    model = Graph2Vec(dimensions=DIMENSIONS, wl_iterations=WL_ITERATIONS, attributed=True)
+    model = Graph2Vec(dimensions=DIMENSIONS, wl_iterations=WL_ITERATIONS, attributed=True, workers=1, seed=0) # set seed and single worker, check https://github.com/piskvorky/gensim/issues/641
     model.fit([_feature_labeled(g) for g in graphs])
     return model.get_embedding()
 
