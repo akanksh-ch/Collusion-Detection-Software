@@ -39,10 +39,20 @@ def compute_metrics(submission_paths: list[str], ground_truth: dict[str, int], p
     # scoring clusters: for each named predicted clustering (e.g. hdbscan, leiden), align its labels and score against ground truth
     for name, clusters in predicted_clusters.items():
         y_pred = np.array([clusters[p] for p in submission_paths])
-        homogeneity, completeness, v_measure = homogeneity_completeness_v_measure(y_group, y_pred)
+
+        # singleton-izing noise: ARI/NMI/homogeneity treat every occurrence of label -1 as one shared
+        # cluster, so unrelated noise points get scored as if the algorithm grouped them together.
+        # Give each noise point its own unique negative label instead, so it's scored as what it
+        # actually is -- a singleton, unclustered on its own -- without touching real cluster ids.
+        y_pred_scored = y_pred.copy()
+        noise_mask = y_pred_scored == -1
+        if noise_mask.any():
+            y_pred_scored[noise_mask] = -np.arange(1, noise_mask.sum() + 1) - 1
+
+        homogeneity, completeness, v_measure = homogeneity_completeness_v_measure(y_group, y_pred_scored)
         results["clustering"][name] = {
-            "ari": float(adjusted_rand_score(y_group, y_pred)),
-            "nmi": float(normalized_mutual_info_score(y_group, y_pred)),
+            "ari": float(adjusted_rand_score(y_group, y_pred_scored)),
+            "nmi": float(normalized_mutual_info_score(y_group, y_pred_scored)),
             "homogeneity": float(homogeneity),
             "completeness": float(completeness),
             "v_measure": float(v_measure),
