@@ -1,6 +1,6 @@
 # Collusion Detection Software
 
-A multi-signal approach to programming collusion detection. The system combines graph-based, lexical, and token-level similarity signals using Similarity Network Fusion (SNF), followed by clustering.
+This repository contains the implementation of the multi-signal collusion detection approach developed for the dissertation. The system combines graph-based, lexical, and token-level similarity signals using Similarity Network Fusion (SNF), followed by Leiden community detection.
 
 ```mermaid
 graph TD
@@ -15,17 +15,18 @@ graph TD
 
 The software is run using Docker. Install [Docker](https://docs.docker.com/get-docker/) before proceeding.
 
-The published image is:
+The Docker image used is:
 
 ```text
 ghcr.io/akanksh-ch/collusion-detection-software:latest
 ```
+###
 
----
 
-## PROGpedia19
 
-Place the PROGpedia19 submissions in a local directory and run:
+## Running on PROGpedia19
+
+To run the collusion detection software on the **PROGpedia19 dataset**, place the dataset in a local directory and run the following command:
 
 ```bash
 docker run \
@@ -40,25 +41,20 @@ docker run \
         --output /app/output/progpedia19-metrics.json
 ```
 
-Replace:
+Replace `/path/to/Progpedia` with the location of the PROGpedia19 dataset. `/path/to/output` is where the resulting metrics file will be written, while `/path/to/cache` stores cached and diagnostic information.
 
-* `/path/to/Progpedia` with the location of the PROGpedia19 dataset.
-* `/path/to/output` with the directory where the metrics should be written.
-* `/path/to/cache` with a directory for cached and diagnostic data.
+## Running on Criminal Minds
 
----
-
-## Criminal Minds
-
-The Criminal Minds replication package should contain the `orig` and `plag` submission directories:
+To run the software on the **Criminal Minds dataset**, obtain the replication package and place the `orig` and `plag` directories under the `code` directory:
 
 ```text
-code/
-├── orig/
-└── plag/
+ReplicationPackage/
+└── code/
+    ├── orig/
+    └── plag/
 ```
 
-Run:
+For example, if the replication package is located at `~/Downloads/ReplicationPackage`, run:
 
 ```bash
 docker run \
@@ -72,19 +68,19 @@ docker run \
         --output /app/submissions/criminalminds-metrics.json
 ```
 
-The output metrics are written to:
+The resulting metrics are written to:
 
 ```text
 ~/Downloads/ReplicationPackage/code/criminalminds-metrics.json
 ```
 
-The cache directory contains intermediate and diagnostic information and can be reused between runs.
-
----
+The cache directory stores intermediate and diagnostic information and can be reused between runs.
 
 ## Docker Shell
 
-To enter the container for testing:
+For testing or inspecting the software directly inside the Docker container, the following command starts an interactive shell.
+
+The example mounts the Criminal Minds `code` directory as `/app/submissions` and the local cache directory as `/root/.cache`:
 
 ```bash
 docker run \
@@ -94,5 +90,4 @@ docker run \
     /bin/bash
 ```
 
-The `:z` mount option is used for SELinux compatibility.
-
+The `:z` mount option is included for SELinux compatibility.
