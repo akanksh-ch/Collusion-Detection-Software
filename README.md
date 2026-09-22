@@ -16,6 +16,8 @@ graph TD
 
 ### Running for datasets
 
+##### PROGpedia19
+
 ```bash
 docker run \
           -v /path/to/Progpedia:/app/submissions:rw,z \
@@ -25,6 +27,8 @@ docker run \
           python main.py submissions --dataset progpedia19 --fusion-method snf --auto-tune \
               --output output/progpedia19-metrics.json
 ```
+
+##### Criminal minds
 
 ```bash
 docker run \
